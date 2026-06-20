@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Secrets & local data
+.env
+data/chroma/
+*.sqlite3
+
+# OS
+.DS_Store

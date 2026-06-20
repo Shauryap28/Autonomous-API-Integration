@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────
+# Phase 1 — Docs → api_schema (RAG over API documentation)
+# Python 3.11+ recommended. Install:  pip install -r requirements.txt
+# Versions left unpinned for first install; pin once Phase 1 runs green.
+# ─────────────────────────────────────────────────────────────
+
+# --- Doc fetching ---
+requests                 # fetch HTML docs / call the API later
+beautifulsoup4           # parse HTML documentation
+lxml                     # fast parser backend for BeautifulSoup
+PyMuPDF                  # parse PDF docs  (import as: fitz)
+
+# --- RAG: embeddings + vector store ---
+sentence-transformers    # BGE-small-en-v1.5 embeddings (local, free; pulls torch)
+chromadb                 # local persistent vector store
+
+# --- Structured extraction (LLM) ---
+google-genai             # current unified Gemini SDK (NOT the deprecated
+                         # google-generativeai). Verify free-tier model
+                         # name at build time (e.g. gemini-2.5-flash).
+
+# --- Validation & config ---
+pydantic                 # validate the extracted api_schema
+python-dotenv            # load secrets/config from .env
+
+# --- Testing ---
+pytest                   # Phase 1 acceptance test (tests/test_rag.py)

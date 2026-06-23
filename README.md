@@ -5,9 +5,6 @@ generates and runs code to fetch the requested data, self-corrects from real HTT
 errors, and escalates to a human when genuinely stuck. Built on a LangGraph cyclic
 state machine.
 
-> **Portfolio narrative:** Project 1 (MDIS) = intelligent document *understanding*.
-> Project 2 (this) = an agentic system that *acts* on what it understands.
-
 This README describes the **current state** of the project, not a change history.
 
 ---
@@ -139,4 +136,3 @@ the BGE-small model (~130MB).
 - **Phase 4** — the self-healing loop (diagnose real errors, retry).
 - **Phase 5** — human-in-the-loop + checkpointing.
 - **Phase 7** — AWS cloud deployment & hardening.
-- See the master plan for the full phase list and the future-upgrades section.

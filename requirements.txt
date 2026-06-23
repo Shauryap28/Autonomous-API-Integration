@@ -1,27 +1,26 @@
-# ─────────────────────────────────────────────────────────────
 # Phase 1 — Docs → api_schema (RAG over API documentation)
-# Python 3.11+ recommended. Install:  pip install -r requirements.txt
-# Versions left unpinned for first install; pin once Phase 1 runs green.
-# ─────────────────────────────────────────────────────────────
+# Python 3.11+.  Install:  pip install -r requirements.txt
 
 # --- Doc fetching ---
-requests                 # fetch HTML docs / call the API later
-beautifulsoup4           # parse HTML documentation
-lxml                     # fast parser backend for BeautifulSoup
-PyMuPDF                  # parse PDF docs  (import as: fitz)
+requests
+beautifulsoup4
+lxml
+PyMuPDF                  # PDF parsing (import as: fitz)
 
-# --- RAG: embeddings + vector store ---
-sentence-transformers    # BGE-small-en-v1.5 embeddings (local, free; pulls torch)
-chromadb                 # local persistent vector store
+# --- RAG: chunking, embeddings, vector store (LangChain stack, matches MDIS) ---
+langchain-text-splitters
+langchain-huggingface
+langchain-chroma
+langchain-core
+sentence-transformers    # BGE-small backend (pulled by langchain-huggingface; pinned for clarity)
+chromadb                 # pulled by langchain-chroma; pinned for clarity
 
-# --- Structured extraction (LLM) ---
-google-genai             # current unified Gemini SDK (NOT the deprecated
-                         # google-generativeai). Verify free-tier model
-                         # name at build time (e.g. gemini-2.5-flash).
+# --- Structured extraction (LLM, next batch) ---
+google-genai             # unified Gemini SDK (NOT the deprecated google-generativeai)
 
 # --- Validation & config ---
-pydantic                 # validate the extracted api_schema
-python-dotenv            # load secrets/config from .env
+pydantic
+python-dotenv
 
 # --- Testing ---
-pytest                   # Phase 1 acceptance test (tests/test_rag.py)
+pytest

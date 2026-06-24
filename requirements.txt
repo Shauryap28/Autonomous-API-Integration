@@ -1,22 +1,23 @@
-# Phase 1 — Docs → api_schema (RAG over API documentation)
+# Phase 1-2 — docs -> ApiSchema -> generated fetch script
 # Python 3.11+.  Install:  pip install -r requirements.txt
 
 # --- Doc fetching ---
 requests
 beautifulsoup4
 lxml
-PyMuPDF                  # PDF parsing (import as: fitz)
+PyMuPDF
 
-# --- RAG: chunking, embeddings, vector store (LangChain stack, matches MDIS) ---
+# --- RAG: chunking, embeddings, vector store (LangChain stack) ---
 langchain-text-splitters
 langchain-huggingface
 langchain-chroma
 langchain-core
-sentence-transformers    # BGE-small backend (pulled by langchain-huggingface; pinned for clarity)
-chromadb                 # pulled by langchain-chroma; pinned for clarity
+sentence-transformers
+chromadb
 
-# --- Structured extraction (LLM, next batch) ---
-google-genai             # unified Gemini SDK (NOT the deprecated google-generativeai)
+# --- LLMs ---
+google-genai             # primary (Gemini)
+groq                     # fallback (Groq, OpenAI-compatible)
 
 # --- Validation & config ---
 pydantic

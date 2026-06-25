@@ -8,6 +8,7 @@ __pycache__/
 .env
 data/chroma/
 *.sqlite3
+data/chroma_db/
 
 # OS
 .DS_Store

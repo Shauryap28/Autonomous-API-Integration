@@ -3,15 +3,13 @@ extractor — turn one endpoint's retrieved doc chunks into a validated ApiSchem
 
 Pulls ALL chunks for the target endpoint (metadata-filtered, so the other ~30
 endpoints on the page are excluded), concatenates them in document order, and
-asks Gemini to fill the ApiSchema via structured output. The SDK enforces the
-schema; Pydantic gives us the validated object back.
+asks the LLM seam to fill the ApiSchema. Provider choice + fallback live in
+backend/llm.py — this module is provider-agnostic.
 """
-from google import genai
-from google.genai import types
-
 from backend.config import settings
 from backend.agent.schemas import ApiSchema
 from backend.rag.vectorstore import get_endpoint_chunks
+from backend.llm import complete_json
 
 _INSTRUCTION = (
     "You are an API integration assistant. From the API documentation below, "
@@ -32,22 +30,4 @@ def extract_api_schema(vectorstore, goal, endpoint_section):
 
     context = "\n\n".join(chunks)
     prompt = _INSTRUCTION.format(goal=goal, context=context)
-
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    resp = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ApiSchema,
-            temperature=0,
-            max_output_tokens=settings.MAX_OUTPUT_TOKENS,
-        ),
-    )
-
-    # response.parsed is the Pydantic object when response_schema is a model;
-    # fall back to validating the raw JSON text if the SDK returns None.
-    schema = resp.parsed
-    if schema is None:
-        schema = ApiSchema.model_validate_json(resp.text)
-    return schema
+    return complete_json(prompt, ApiSchema, settings.EXTRACT_MAX_OUTPUT_TOKENS)

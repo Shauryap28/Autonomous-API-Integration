@@ -5,60 +5,62 @@ generates and runs code to fetch the requested data, self-corrects from real HTT
 errors, and escalates to a human when genuinely stuck. Built on a LangGraph cyclic
 state machine.
 
-This README describes the **current state** of the project, not a change history.
+This README describes the **current state**, not a change history.
 
 ---
 
-## Current capability (Phase 1 complete)
+## Current capability (Phases 1-2 complete)
 
-The system can take one API's documentation and a goal, and produce a clean,
-validated **`ApiSchema`** — the structured "cheat-sheet" describing how to call a
-single endpoint (auth, path, headers, parameters, pagination, response shape).
+Given an API's docs (URL or PDF) and a goal, the system:
+1. **comprehends the docs** into a validated `ApiSchema` (Phase 1), and
+2. **generates a Python script from that schema and runs it** to fetch the data,
+   printing it as JSON (Phase 2).
 
-Phase 1 is the **doc-comprehension layer**. It does not yet generate or run code —
-that begins in Phase 2.
+It does not yet sandbox execution, self-correct from errors, or sync to a database —
+those are Phases 3, 4, and the persist step.
 
 ### What works today
-- Fetch API docs from a **URL** or a local **PDF/HTML** file, normalized to clean
-  text with markdown headings preserved.
-- **Section-aware chunking** that tags every chunk with its enclosing endpoint.
-- Local **BGE-small** embeddings + **ChromaDB** vector store.
-- **Endpoint-scoped retrieval** via a metadata filter, so a multi-endpoint docs
-  page doesn't contaminate results with the wrong endpoint's sections.
-- **Structured extraction** with Gemini → a Pydantic-validated `ApiSchema`.
+- Fetch docs from a **URL** or local **PDF/HTML**, normalized to clean text with
+  markdown headings.
+- **Section-aware chunking** tagging each chunk with its enclosing endpoint.
+- Local **BGE-small** embeddings + **ChromaDB**.
+- **Endpoint-scoped retrieval** (metadata filter) — no cross-endpoint contamination.
+- **Structured extraction** → a Pydantic-validated `ApiSchema`.
+- **Code generation** from schema + goal → a runnable `requests` script.
+- **Local execution** of that script, capturing stdout/stderr/exit code.
+- **LLM resilience:** Gemini primary with 503 retry/backoff; automatic **Groq
+  fallback** (`openai/gpt-oss-120b`) when Gemini is unavailable.
 
 ### Validated on
-- **GitHub REST API**, endpoint *"List organization repositories"*
-  (`GET /orgs/{org}/repos`). Extraction returns the correct auth method, path,
-  `Accept` header, parameters, page-based pagination, and response shape.
+- **GitHub REST API**, *"List organization repositories"* — extracts the correct
+  schema, generates a script, and fetches 50 real repos end-to-end (verified even
+  under a live Gemini outage, via the Groq fallback).
 
 ---
 
-## Architecture (Phase 1 pipeline)
+## Architecture (current pipeline)
 
 ```
 docs URL / PDF  +  natural-language goal
         |
-        v
-  fetcher      -> clean text, headings as markdown (#, ##, ###)
+   [ Phase 1: comprehension ]
         |
-        v
-  chunker      -> section-aware chunks, each tagged with {endpoint_section,
-        |          section_title, chunk_index, doc_name}  (LangChain Documents)
-        v
-  embeddings   -> BGE-small-en-v1.5 (local, free)
+  fetcher ----> chunker ----> embeddings ----> vectorstore
+   (clean text   (section-      (BGE-small)      (ChromaDB)
+    + headings)   aware Docs)                         |
+                                                      v
+                                         retrieval (endpoint filter)
+                                                      |
+                                                      v
+                                            extractor --> ApiSchema (validated)
         |
-        v
-  vectorstore  -> ChromaDB (persistent, cosine)
+   [ Phase 2: action ]
         |
-        v
-  retrieval    -> metadata filter to the TARGET endpoint's chunks only
-        |
-        v
-  extractor    -> Gemini structured output -> ApiSchema (Pydantic validated)
-        |
-        v
-  ApiSchema    -> the contract every later phase will read
+  codegen ----> local_runner ----> fetched JSON
+  (schema+goal   (subprocess;
+   -> script)     stdout/stderr/exit)
+
+  backend/llm.py underlies extractor + codegen: Gemini primary, Groq fallback.
 ```
 
 ---
@@ -67,72 +69,70 @@ docs URL / PDF  +  natural-language goal
 ```
 autonomous-api-integration-engine/
 ├── backend/
+│   ├── llm.py                # LLM seam: Gemini primary + Groq fallback
 │   ├── agent/
-│   │   ├── schemas.py        # ApiSchema — the Phase 1 output contract
-│   │   └── state.py          # AgentState skeleton (filled in later phases)
+│   │   ├── schemas.py        # ApiSchema — the comprehension contract
+│   │   ├── codegen.py        # schema + goal -> Python fetch script
+│   │   └── state.py          # AgentState skeleton (later phases)
 │   ├── rag/
 │   │   ├── fetcher.py        # URL/PDF -> clean text + fetchability report
 │   │   ├── chunker.py        # section-aware -> LangChain Documents
-│   │   ├── embeddings.py     # BGE-small (reused from MDIS)
-│   │   ├── vectorstore.py    # ChromaDB wrapper + get_endpoint_chunks
+│   │   ├── embeddings.py     # BGE-small
+│   │   ├── vectorstore.py    # ChromaDB + get_endpoint_chunks
 │   │   ├── retriever.py      # endpoint-scoped similarity retrieval
-│   │   └── extractor.py      # retrieved chunks -> Gemini -> ApiSchema
-│   └── config/
-│       └── settings.py       # single source of truth for config
+│   │   └── extractor.py      # retrieved chunks -> ApiSchema
+│   └── config/settings.py    # single source of truth
 ├── data/chroma_db/           # local vector store (gitignored)
-├── tests/                    # (test_rag.py — Phase 1 acceptance test)
-├── main.py                   # end-to-end Phase 1 runner
+├── tests/                    # test_rag.py
+├── main.py                   # end-to-end runner (docs -> schema -> code -> fetch)
+├── discover.py               # generality probe: list a doc's endpoints (no LLM)
 ├── requirements.txt
 └── .env                      # GEMINI_API_KEY, GROQ_API_KEY
 ```
 
 ---
 
-## Setup
+## Setup & run
 
 ```bash
 python -m venv .venv
-# Windows:  .venv\Scripts\Activate.ps1     macOS/Linux:  source .venv/bin/activate
+.venv\Scripts\Activate.ps1            # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
-cp .env.example .env          # then add your keys
+# put GEMINI_API_KEY and GROQ_API_KEY in .env
 ```
-
-`.env` needs:
-```
-GEMINI_API_KEY=...            # used now (extraction)
-GROQ_API_KEY=...              # reserved for Phase 2+
-```
-
-## Run
 
 ```bash
-python main.py                       # default: GitHub repos docs URL
-python main.py path/to/doc.pdf       # a saved PDF/HTML/markdown file
+python main.py                        # full pipeline on the GitHub repos endpoint
+python discover.py <url-or-file>      # probe any doc's endpoint structure
 ```
 
-Prints the validated `ApiSchema` for the target endpoint. First run downloads
-the BGE-small model (~130MB).
+First run downloads the BGE-small model (~130MB).
 
 ---
 
-## The `ApiSchema` contract
+## Development line (roadmap)
 
-| Field | Meaning |
-|---|---|
-| `auth_method` | `none` / `api_key` / `bearer` / `oauth2` |
-| `base_url`, `endpoint`, `http_method` | where and how to call it |
-| `required_headers` | list of `{name, value}` |
-| `parameters` | list of `{name, location, required, description}` |
-| `pagination` | `{type, param_names, notes}` |
-| `response_data_path` | JSON path to the records (empty = top-level array) |
-| `rate_limit`, `success_criteria`, `notes` | extras used by later phases |
+| Phase | Capability | Status |
+|---|---|---|
+| 1 | Docs → validated `ApiSchema` | ✅ done |
+| 2 | Schema → generated script → real fetch (local) | ✅ done |
+| 3 | Docker sandbox (replace `local_runner`, contained) | next |
+| 4 | Self-healing loop + multi-API gauntlet (PokeAPI / REST Countries / Jikan) | planned |
+| **4.5** | **Comprehension hardening — see below** | **planned, measure-driven** |
+| 5 | Human-in-the-loop + checkpointing | planned |
+| 6 | Demo surface + eval harness | planned |
+| 7 | AWS deployment & hardening (RDS, Parameter Store, CloudWatch) | planned |
+| 8 | Safe write operations (POST/PUT/DELETE, idempotency, HITL-before-mutate) | future |
 
----
-
-## Roadmap (next)
-- **Phase 2** — generate a Python fetch script from the schema + goal, run it
-  locally, get one real successful fetch (no sandbox, no loop yet).
-- **Phase 3** — move execution into a Docker sandbox.
-- **Phase 4** — the self-healing loop (diagnose real errors, retry).
-- **Phase 5** — human-in-the-loop + checkpointing.
-- **Phase 7** — AWS cloud deployment & hardening.
+### Phase 4.5 — Comprehension hardening (scheduled after Phase 4)
+Two known limitations are deliberately deferred to here, because the multi-API
+gauntlet in Phase 4 is what brings the varied/messy docs that would actually
+trigger them (measure-then-fix; built only if a real doc breaks):
+- **Table parsing in `fetcher`.** Today HTML tables are *flattened* (cell text is
+  captured, structure isn't). Worked on GitHub. If a future API's params come out
+  scrambled, render `<table>` rows as structured text
+  (`name: org | required: true | desc: ...`) instead of flattening.
+- **PDF heading detection.** The PDF input path (PyMuPDF) is wired but untested;
+  PDFs return text with no heading markers, so chunking falls back to fixed-size
+  windows and loses endpoint structure. If an API ships PDF-only docs, add
+  heading-detection heuristics (font size / numbering) so PDFs chunk like HTML.

@@ -1,23 +1,22 @@
 """
-main.py — Phase 2 end-to-end: docs -> ApiSchema -> generated script -> real fetch.
+main.py — full pipeline: docs -> ApiSchema -> generated script -> run -> fetched JSON.
 
-Run from the repo root:
+Execution backend is chosen by settings.USE_SANDBOX (Docker sandbox by default,
+local runner as fallback). Run from the repo root:
     python main.py                  # default: GitHub repos docs URL
     python main.py path/to/doc.pdf
-
-Pipeline: fetch -> chunk -> embed -> store -> extract schema -> generate code ->
-run locally -> print the fetched data. (No sandbox, no retry loop yet.)
 """
 import json
 import sys
 
+from backend.config import settings
 from backend.rag.fetcher import fetch
 from backend.rag.chunker import chunk
 from backend.rag.embeddings import get_embeddings
 from backend.rag.vectorstore import get_vectorstore, add_documents, count, clear
 from backend.rag.extractor import extract_api_schema
 from backend.agent.codegen import generate_code
-from backend.sandbox.local_runner import run_script
+from backend.sandbox.runner import get_runner
 
 DEFAULT_SRC = "https://docs.github.com/en/rest/repos/repos"
 GOAL = "List the first 50 public repositories of the 'github' organization."
@@ -44,19 +43,22 @@ def main():
     clear(vs)
     add_documents(vs, docs)
     print(f"store:  {count(vs)} chunks indexed")
-    print("extract: asking Gemini to fill the ApiSchema...")
+    print("extract: asking the LLM to fill the ApiSchema...")
     schema = extract_api_schema(vs, GOAL, TARGET_ENDPOINT)
     print("schema:  OK\n")
 
-    # --- Phase 2: schema -> code -> run ---
+    # --- Phase 2: schema -> code ---
     print("codegen: generating the fetch script...")
     code = generate_code(schema, GOAL)
     print("----- generated script -----")
     print(code)
     print("----------------------------\n")
 
-    print("execute: running the script LOCALLY (unsandboxed)...")
-    result = run_script(code)
+    # --- Phase 3: run it (sandbox or local, per settings.USE_SANDBOX) ---
+    backend = "Docker sandbox" if settings.USE_SANDBOX else "local subprocess"
+    print(f"execute: running via {backend}...")
+    runner = get_runner()
+    result = runner.run_script(code)
     print(f"exit_code = {result.exit_code}")
     if result.stderr.strip():
         print("--- stderr ---")

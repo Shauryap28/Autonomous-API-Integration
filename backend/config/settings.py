@@ -28,7 +28,7 @@ DISTANCE_METRIC = "cosine"
 TOP_K = 3
 
 # --- Generation ---
-EXTRACT_MAX_OUTPUT_TOKENS = 2048
+EXTRACT_MAX_OUTPUT_TOKENS = 4096   # schema + the model's verbose field descriptions
 CODEGEN_MAX_OUTPUT_TOKENS = 2048
 
 # --- Execution ---

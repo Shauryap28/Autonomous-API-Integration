@@ -9,23 +9,22 @@ know or care which provider answered.
   complete_text(prompt, max_tokens)               -> str
   complete_json(prompt, SchemaModel, max_tokens)  -> validated SchemaModel instance
 
-Note: clients are created ONCE and reused. Creating a genai.Client per call lets
-the wrapper be garbage-collected mid-request, which closes its httpx transport
-("Cannot send a request, as the client has been closed").
+Clients are created ONCE and reused (a per-call client gets GC'd mid-request and
+closes its httpx transport).
 """
 import time
 
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+from pydantic import ValidationError
 
 from backend.config import settings
 
 _GEMINI_ERRORS = (genai_errors.ServerError, genai_errors.ClientError)
 _RETRIES = 3
-_BACKOFF_BASE = 2  # seconds -> 2, 4 (between 3 attempts)
+_BACKOFF_BASE = 2  # seconds -> 2, 4
 
-# Module-level singletons (lazy). Held here so they are never GC'd mid-call.
 _gemini = None
 _groq = None
 
@@ -40,7 +39,7 @@ def _gemini_client():
 def _groq_client():
     global _groq
     if _groq is None:
-        from groq import Groq  # lazy import: only needed if the fallback fires
+        from groq import Groq
         if not settings.GROQ_API_KEY:
             raise RuntimeError(
                 "Gemini is unavailable and GROQ_API_KEY is not set — add it to "
@@ -51,7 +50,6 @@ def _groq_client():
 
 
 def _retry_gemini(call):
-    """Run a Gemini call; retry transient 5xx with backoff; break early on 4xx."""
     last = None
     for i in range(_RETRIES):
         try:
@@ -94,7 +92,6 @@ def complete_text(prompt, max_output_tokens, temperature=0):
 # ---------- json (structured) ----------
 
 def complete_json(prompt, schema_model, max_output_tokens, temperature=0):
-    """Return a validated `schema_model` instance (Gemini primary, Groq fallback)."""
     try:
         return _gemini_json(prompt, schema_model, max_output_tokens, temperature)
     except _GEMINI_ERRORS as e:
@@ -116,17 +113,30 @@ def _gemini_json(prompt, schema_model, max_output_tokens, temperature):
     ))
     if resp.parsed is not None:
         return resp.parsed
+
+    # Fallback: validate the raw JSON text. Detect truncation robustly so we raise
+    # a CLEAR error instead of a cryptic Pydantic "EOF while parsing".
     text = (resp.text or "").strip()
-    if not text or _finish_reason(resp) == "MAX_TOKENS":
+    reason = _finish_reason(resp)
+    if not text or "MAX_TOKENS" in reason.upper():
         raise RuntimeError(
-            f"Gemini output truncated (finish_reason={_finish_reason(resp)}); "
-            "raise the relevant *_MAX_OUTPUT_TOKENS setting."
+            f"LLM output was truncated before the JSON was complete "
+            f"(finish_reason={reason}). Raise the relevant *_MAX_OUTPUT_TOKENS "
+            "setting and retry."
         )
-    return schema_model.model_validate_json(text)
+    try:
+        return schema_model.model_validate_json(text)
+    except ValidationError as e:
+        # Any validation failure on the fallback text is almost always truncated /
+        # malformed output — surface it clearly rather than as a raw parser error.
+        raise RuntimeError(
+            "LLM returned JSON that failed schema validation (likely truncated or "
+            f"malformed; finish_reason={reason}). Raise *_MAX_OUTPUT_TOKENS or retry.\n"
+            f"First 200 chars: {text[:200]}"
+        ) from e
 
 
 def _groq_json(prompt, schema_model, max_output_tokens, temperature):
-    # Groq JSON mode needs the literal word 'json' + the target shape in the prompt.
     augmented = (
         prompt
         + "\n\nRespond with ONLY a single valid json object that conforms to this "

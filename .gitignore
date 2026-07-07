@@ -12,3 +12,4 @@ data/chroma_db/
 
 # OS
 .DS_Store
+DESIGN_LOG.md

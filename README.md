@@ -2,67 +2,75 @@
 
 An agentic AI system that reads an API's documentation plus a natural-language goal,
 generates code to fetch the requested data, runs that code inside an isolated sandbox,
-and (in later phases) self-corrects from real HTTP errors and escalates to a human when
-stuck. Built toward a LangGraph cyclic state machine.
+and self-corrects from real HTTP errors — retrying until it succeeds or exhausts a
+bounded retry budget. Built on a LangGraph cyclic state machine.
 
 This README describes the **current state**, not a change history.
 
 ---
 
-## Current capability (Phases 1-3 complete)
+## Current capability (Phases 1-4 complete)
 
-Given an API's docs (URL or PDF) and a goal, the system:
-1. **comprehends the docs** into a validated `ApiSchema` (Phase 1),
-2. **generates a Python script** from that schema and goal (Phase 2), and
-3. **runs that script inside an isolated Docker sandbox** and returns the fetched
-   data (Phase 3).
+Given an API's docs (URL or PDF) and a natural-language goal, the system:
+1. **comprehends the docs** into a validated `ApiSchema` (auth, endpoint, params,
+   pagination, response shape),
+2. **generates a Python script** from that schema and goal,
+3. **runs it inside an isolated Docker sandbox**, and
+4. **on failure, reads the real error, re-queries the docs for the section that
+   explains it, rewrites the script, and retries** — bounded, with memory of every
+   past attempt.
 
-It does not yet self-correct from errors, loop, or sync to a database — those are
-Phase 4 and beyond.
+Not yet implemented: human-in-the-loop escalation, checkpoint/resume, database sync.
 
 ### What works today
-- Fetch docs from a **URL** or local **PDF/HTML**, normalized to clean text with
-  markdown headings.
-- **Section-aware chunking**, each chunk tagged with its enclosing endpoint.
-- Local **BGE-small** embeddings + **ChromaDB**.
-- **Endpoint-scoped retrieval** (metadata filter) — no cross-endpoint contamination.
+- Fetch docs from a **URL** or local **PDF/HTML**; headings normalized to markdown.
+- **Section-aware chunking**, each chunk tagged with its enclosing endpoint section.
+- Local **BGE-small** embeddings + **ChromaDB**; **endpoint-scoped retrieval**.
 - **Structured extraction** into a Pydantic-validated `ApiSchema`.
 - **Code generation** from schema + goal into a runnable `requests` script.
-- **Sandboxed execution** in a Docker container: no host filesystem, capped
-  memory/CPU, read-only filesystem, non-root user, hard timeout.
+- **Sandboxed execution**: no host filesystem, capped memory/CPU, read-only
+  filesystem, non-root user, hard timeout.
+- **Self-healing loop** (LangGraph): conditional routing on the execution result,
+  error-driven doc retrieval, full-script regeneration, bounded retries, and an
+  append-only `error_history` so a failed fix is never repeated.
 - **LLM resilience:** Gemini primary with 503 retry/backoff; automatic **Groq
-  fallback** (`openai/gpt-oss-120b`) when Gemini is unavailable.
+  fallback** (`openai/gpt-oss-120b`).
 
 ### Validated on
-- **GitHub REST API**, *"List organization repositories"* — extracts the schema,
-  generates a script, and fetches 50 real repos end-to-end, executed inside the
-  container. Safety proven: infinite loops are killed at the timeout; file writes
-  are blocked by the read-only filesystem; code runs as a non-root user.
+- **GitHub REST API** (`/orgs/{org}/repos`) — page-based pagination, top-level array
+  response. Fetches 50 repos. With a deliberately corrupted endpoint path, the agent
+  receives a real **404**, retrieves the relevant doc section, corrects the path, and
+  succeeds on attempt 2.
+- **PokéAPI** (`/pokemon`) — **offset/limit** pagination and records **nested under
+  `results`**, both structurally different from GitHub. Succeeded first try, with no
+  code changes to the pipeline.
 
 ---
 
-## Architecture (current pipeline)
+## Architecture
 
 ```
 docs URL / PDF  +  natural-language goal
         |
-   [ Phase 1: comprehension ]
-  fetcher -> chunker -> embeddings -> vectorstore -> retrieval (endpoint filter)
+   [ SETUP — runs once: comprehension ]
+  fetcher -> chunker -> embeddings -> vectorstore -> endpoint-scoped retrieval
                                                           |
-                                                          v
                                               extractor -> ApiSchema (validated)
         |
-   [ Phase 2: code generation ]
-  codegen (schema + goal -> Python fetch script)
+   [ AGENT GRAPH — LangGraph, cyclic ]
         |
-   [ Phase 3: sandboxed execution ]
-  runner (USE_SANDBOX?) -> docker_runner -> [ container: capped, read-only,
-        |                                      non-root, no host mount ] -> JSON
-        |                     \--> local_runner (fallback if USE_SANDBOX=False)
-        v
-  fetched JSON  (exit_code / stdout / stderr)
+   START -> generate_code -> execute -> <route_result>
+                                ^             |
+                                |             +-- success            -> END
+                                |             +-- retries exhausted  -> END (failed)
+                                |             +-- retry -> diagnose_and_fix --+
+                                +----------------------------------------------+
 
-  backend/llm.py underlies extraction + codegen: Gemini primary, Groq fallback.
+   execute  = the Docker sandbox (capped, read-only, non-root, no host mount)
+   diagnose = reads the REAL error + the doc section retrieved USING that error
+              + error_history -> regenerates the full script
+
+  backend/llm.py underlies extraction / codegen / diagnosis: Gemini -> Groq fallback.
 ```
 
 ---
@@ -73,27 +81,24 @@ autonomous-api-integration-engine/
 ├── backend/
 │   ├── llm.py                  # LLM seam: Gemini primary + Groq fallback
 │   ├── agent/
-│   │   ├── schemas.py          # ApiSchema — the comprehension contract
+│   │   ├── state.py            # AgentState (TypedDict; error_history has an append reducer)
+│   │   ├── graph.py            # the cyclic StateGraph
+│   │   ├── nodes.py            # generate_code / execute / diagnose / route_result
 │   │   ├── codegen.py          # schema + goal -> Python fetch script
-│   │   └── state.py            # AgentState skeleton (later phases)
-│   ├── rag/
-│   │   ├── fetcher.py          # URL/PDF -> clean text + fetchability report
-│   │   ├── chunker.py          # section-aware -> LangChain Documents
-│   │   ├── embeddings.py       # BGE-small
-│   │   ├── vectorstore.py      # ChromaDB + get_endpoint_chunks
-│   │   ├── retriever.py        # endpoint-scoped similarity retrieval
-│   │   └── extractor.py        # retrieved chunks -> ApiSchema
+│   │   ├── diagnose.py         # error + relevant docs + history -> corrected script
+│   │   └── schemas.py          # ApiSchema — the comprehension contract
+│   ├── rag/                    # fetcher, chunker, embeddings, vectorstore,
+│   │                           # retriever, extractor
 │   ├── sandbox/
-│   │   ├── local_runner.py     # run script as a local subprocess (fallback)
-│   │   ├── docker_runner.py    # run script in an isolated Docker container
-│   │   └── runner.py           # selects runner via settings.USE_SANDBOX
+│   │   ├── docker_runner.py    # isolated container execution
+│   │   ├── local_runner.py     # local subprocess (fallback)
+│   │   └── runner.py           # selects backend via settings.USE_SANDBOX
 │   └── config/settings.py      # single source of truth
-├── sandbox_image/Dockerfile    # minimal python:3.11-slim + requests, non-root
+├── sandbox_image/Dockerfile    # python:3.11-slim + requests, non-root
 ├── data/chroma_db/             # local vector store (gitignored — generated)
-├── tests/                      # test_rag.py
-├── main.py                     # end-to-end runner
-├── discover.py                 # generality probe: list a doc's endpoints (no LLM)
-├── test_sandbox_isolation.py   # sandbox safe-failure checks
+├── main.py                     # setup + agent graph
+├── discover.py                 # probe any doc's endpoint structure (no LLM)
+├── test_sandbox_isolation.py   # sandbox safety checks
 ├── requirements.txt
 └── .env                        # GEMINI_API_KEY, GROQ_API_KEY
 ```
@@ -109,9 +114,7 @@ pip install -r requirements.txt
 # put GEMINI_API_KEY and GROQ_API_KEY in .env
 ```
 
-Phase 3 also requires **Docker Desktop** installed and running, and the sandbox
-image built once:
-
+Requires **Docker Desktop** running, and the sandbox image built once:
 ```bash
 docker build -t aaie-sandbox ./sandbox_image
 ```
@@ -119,39 +122,40 @@ docker build -t aaie-sandbox ./sandbox_image
 ## Run
 
 ```bash
-python main.py                        # full pipeline (docs -> schema -> code -> sandboxed fetch)
-python discover.py <url-or-file>      # probe any doc's endpoint structure (no LLM)
+python main.py                        # full agent run
+python discover.py <url-or-file>      # list a doc's endpoint sections (no LLM)
 python test_sandbox_isolation.py      # prove the sandbox's safety guarantees
 ```
 
-First run downloads the BGE-small model (~130MB). To run without Docker, set
-`USE_SANDBOX = False` in `settings.py` (falls back to local execution).
+To watch the self-healing loop, set `FORCE_FAILURE = True` in `settings.py`: the
+first generated script is deliberately corrupted, producing a genuine HTTP 404 that
+the agent must diagnose and repair.
 
 ---
 
-## Configuration (settings.py highlights)
+## Configuration (settings.py)
+
 | Setting | Purpose |
 |---|---|
+| `MAX_RETRIES` | bounded retry budget for the self-healing loop (default 5) |
+| `FORCE_FAILURE` | demo lever: corrupt the first script to force a real error |
 | `USE_SANDBOX` | `True` = Docker sandbox; `False` = local execution fallback |
-| `SANDBOX_IMAGE` | image tag built from `sandbox_image/Dockerfile` |
-| `SANDBOX_MEM_LIMIT` / `SANDBOX_CPUS` | container memory / CPU caps |
-| `SANDBOX_TIMEOUT` | seconds before a runaway container is killed |
-| `SANDBOX_READONLY` | read-only container filesystem |
+| `SANDBOX_*` | image, memory/CPU caps, timeout, read-only filesystem |
 | `EXTRACT_MAX_OUTPUT_TOKENS` / `CODEGEN_MAX_OUTPUT_TOKENS` | LLM output budgets |
 | `TOP_K`, `CHUNK_*` | retrieval / chunking knobs |
 
 ---
 
-## Development line (roadmap)
+## Development line
 
 | Phase | Capability | Status |
 |---|---|---|
 | 1 | Docs -> validated `ApiSchema` | done |
 | 2 | Schema -> generated script -> real fetch | done |
 | 3 | Docker sandbox (contained execution) | done |
-| 4 | Self-healing loop (LangGraph): diagnose errors, retry, error-history | next |
-| 4.5 | Comprehension hardening: table parsing + PDF heading detection (measure-driven) | planned |
-| 5 | Human-in-the-loop + checkpointing | planned |
+| 4 | Self-healing loop (LangGraph cyclic graph) | done |
+| 4.5 | Comprehension hardening: table parsing + PDF heading detection | planned |
+| 5 | Human-in-the-loop + checkpoint/resume | next |
 | 6 | Demo surface + eval harness | planned |
-| 7 | AWS deployment & hardening (RDS, Parameter Store, CloudWatch); egress lockdown | planned |
-| 8 | Safe write operations (POST/PUT/DELETE, idempotency, HITL-before-mutate) | future |
+| 7 | AWS deployment & hardening; egress lockdown | planned |
+| 8 | Safe write operations (idempotency, HITL-before-mutate) | future |

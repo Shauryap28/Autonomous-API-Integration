@@ -1,16 +1,39 @@
 """
-AgentState — the typed, shared state object that flows through the LangGraph
-state machine in later phases.
+AgentState — the typed, shared state that flows through the LangGraph state machine.
 
-Defined early (Phase 1) on purpose: the `api_schema` field is the *output
-contract* of the RAG pipeline we build now. Phase 1 ends when we can produce a
-validated api_schema; everything else in this state gets filled in later.
+Every node receives the whole state and returns a PARTIAL dict of just the fields
+it changed; LangGraph merges those updates back in.
 
-TODO (Phase 1): define AgentState as a TypedDict carrying at least the doc
-inputs (goal, doc_url) and api_schema. Add codegen / execution / retry / HITL
-fields in their respective phases — not before we need them.
+Merge rules matter:
+  • plain fields          -> last write wins (overwrite)
+  • Annotated[..., add]   -> APPEND (concatenate) instead of overwrite
 
-Gotcha to remember for later: list fields like `error_history` need an
-annotated reducer (Annotated[list, operator.add]) or LangGraph overwrites
-instead of appends.
+`error_history` MUST use the append reducer. Without it, each diagnose step would
+overwrite the record of past failures — and that memory is precisely what stops the
+agent from repeating a fix that already failed.
+
+The FULL schema (including the loop/HITL fields) is defined now, even though Piece 1
+only uses some of it: changing the schema later invalidates saved checkpoints
+(Phase 5), so it's cheaper to get it right up front.
 """
+import operator
+from typing import Annotated, Optional, TypedDict
+
+
+class AgentState(TypedDict):
+    # --- inputs (produced by the one-time comprehension step) ---
+    goal: str
+    api_schema: dict              # the validated ApiSchema, as a dict
+
+    # --- codegen + execution ---
+    current_code: str             # the latest script attempt
+    execution_result: dict        # {exit_code, stdout, stderr} from the sandbox
+
+    # --- the retry loop (used from Piece 2 on) ---
+    attempt_number: int
+    max_retries: int
+    error_history: Annotated[list, operator.add]   # APPENDS — see note above
+
+    # --- outcome ---
+    status: str                   # running | success | failed
+    fetched_data: Optional[list]  # parsed from stdout on success

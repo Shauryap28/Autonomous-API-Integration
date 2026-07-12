@@ -28,16 +28,27 @@ DISTANCE_METRIC = "cosine"
 TOP_K = 3
 
 # --- Generation ---
-EXTRACT_MAX_OUTPUT_TOKENS = 4096   # schema + the model's verbose field descriptions
-CODEGEN_MAX_OUTPUT_TOKENS = 2048
+EXTRACT_MAX_OUTPUT_TOKENS = 8192
+CODEGEN_MAX_OUTPUT_TOKENS = 4096
 
 # --- Execution ---
 EXEC_TIMEOUT = 30                  # seconds; local runner cap
 
 # --- Sandbox (Phase 3) ---
 USE_SANDBOX = True                 # True = Docker sandbox; False = local_runner fallback
-SANDBOX_IMAGE = "aaie-sandbox"     # built from sandbox_image/Dockerfile
-SANDBOX_MEM_LIMIT = "256m"         # hard memory cap
-SANDBOX_CPUS = 0.5                 # half a CPU
-SANDBOX_TIMEOUT = 30               # seconds; container is killed if it overruns
-SANDBOX_READONLY = True            # read-only root filesystem inside the container
+SANDBOX_IMAGE = "aaie-sandbox"
+SANDBOX_MEM_LIMIT = "256m"
+SANDBOX_CPUS = 0.5
+SANDBOX_TIMEOUT = 30
+SANDBOX_READONLY = True
+
+# --- Agent loop (Phase 4) ---
+# Bounded retries: a stuck agent must never loop forever burning API quota.
+# 5 is enough to correct genuine mistakes, small enough to fail fast when hopeless.
+MAX_RETRIES = 5
+
+# Demo lever: our GitHub call succeeds first try, so nothing would naturally
+# exercise the self-healing loop. FORCE_FAILURE deliberately corrupts the FIRST
+# generated script (breaks the endpoint path) so the API returns a real 404 and the
+# agent must diagnose and repair it. Set False for normal runs.
+FORCE_FAILURE = False

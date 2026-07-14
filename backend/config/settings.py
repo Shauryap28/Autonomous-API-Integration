@@ -52,3 +52,11 @@ MAX_RETRIES = 5
 # generated script (breaks the endpoint path) so the API returns a real 404 and the
 # agent must diagnose and repair it. Set False for normal runs.
 FORCE_FAILURE = False
+
+# --- Endpoint selection ---
+# The LLM proposes the top-3 doc sections matching the goal; the human confirms.
+# Set False to auto-accept the top pick (scripted runs / demos without a prompt).
+# The plan's warning applies: too eager to ask = annoying; too reluctant = hallucinated
+# guesses. A toggle resolves that rather than picking one extreme.
+CONFIRM_ENDPOINT = True
+SELECT_MAX_OUTPUT_TOKENS = 1024   # section names + 3 candidates — a small response

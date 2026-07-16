@@ -2,16 +2,14 @@
 main.py — docs URL + goal -> the agent does the rest.
 
   SETUP (once):
-    fetch -> chunk -> SELECT ENDPOINT (LLM proposes, human confirms) -> embed -> store
-          -> extract the ApiSchema
+    fetch -> chunk -> SELECT ENDPOINT (LLM proposes, human confirms)
+          -> IDENTIFY GLOBAL SECTIONS (pagination/auth documented separately?)
+          -> embed -> store -> extract the ApiSchema (endpoint + global context)
   GRAPH (loops):
     generate_code -> execute -> [success | diagnose_and_fix -> execute -> ...]
 
-The endpoint is no longer hardcoded: it is derived from the goal, with the human as a
-check. An impossible goal is denied up front — before any embedding or codegen.
-
 Run from the repo root:
-    python main.py                          # uses DEFAULT_SRC + GOAL below
+    python main.py
     python main.py <docs-url-or-file>
     python main.py <docs-url-or-file> "your natural-language goal"
 """
@@ -25,6 +23,7 @@ from backend.rag.embeddings import get_embeddings
 from backend.rag.vectorstore import get_vectorstore, add_documents, count, clear
 from backend.rag.extractor import extract_api_schema
 from backend.agent.selector import select_endpoint, confirm_endpoint
+from backend.agent.global_sections import identify_global_sections
 from backend.agent.graph import build_graph
 
 DEFAULT_SRC = "https://docs.github.com/en/rest/repos/repos"
@@ -36,7 +35,6 @@ def _doc_name_from(src):
 
 
 def _section_names(docs):
-    """Unique endpoint-section names, most chunks first (the doc's real structure)."""
     counts = {}
     for d in docs:
         name = d.metadata["endpoint_section"]
@@ -51,7 +49,6 @@ def main():
     print(f"Source: {src}")
     print(f"Goal:   {goal}\n")
 
-    # --- fetch + chunk (cheap; gives us the section list) ---
     r = fetch(src)
     print(f"fetch:  chars={r.char_count}  headings={r.heading_count}  thin={r.looks_thin}")
     if r.looks_thin:
@@ -62,16 +59,24 @@ def main():
     sections = _section_names(docs)
     print(f"chunk:  {len(docs)} chunks across {len(sections)} sections")
 
-    # --- select the endpoint from the goal (deny early if impossible) ---
+    # --- select the target endpoint (deny early if impossible) ---
     print("select: matching your goal to a documentation section...")
     result = select_endpoint(goal, sections)
     target_endpoint = confirm_endpoint(result, sections)
     if target_endpoint is None:
         print("\nStopping: no suitable endpoint. Try a different goal or docs source.")
         return
-    print(f"target: {target_endpoint}\n")
+    print(f"target: {target_endpoint}")
 
-    # --- embed + store + extract (only now — after we know the goal is achievable) ---
+    # --- identify GLOBAL sections (pagination/auth documented separately?) ---
+    global_sections = identify_global_sections(sections, exclude=target_endpoint)
+    if global_sections:
+        print(f"global: also reading shared sections -> {', '.join(global_sections)}")
+    else:
+        print("global: none (this doc documents concerns per-endpoint)")
+    print()
+
+    # --- embed + store + extract ---
     print("embed:  loading BGE-small + embedding chunks...")
     vectorstore = get_vectorstore(get_embeddings())
     clear(vectorstore)
@@ -79,10 +84,9 @@ def main():
     print(f"store:  {count(vectorstore)} chunks indexed")
 
     print("extract: asking the LLM to fill the ApiSchema...")
-    schema = extract_api_schema(vectorstore, goal, target_endpoint)
-    print("schema:  OK\n")
+    schema = extract_api_schema(vectorstore, goal, target_endpoint, global_sections)
+    print(f"schema:  OK  (pagination.type = {schema.pagination.type.value})\n")
 
-    # --- run the agent graph ---
     initial_state = {
         "goal": goal,
         "api_schema": schema.model_dump(),

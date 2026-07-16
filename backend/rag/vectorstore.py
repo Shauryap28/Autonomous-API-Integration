@@ -29,16 +29,28 @@ def clear(vectorstore):
         vectorstore.delete(ids=ids)
 
 
-def get_endpoint_chunks(vectorstore, endpoint_section):
-    """Return all chunk texts for ONE endpoint, in document order.
+def get_section_chunks(vectorstore, section_names):
+    """Return all chunk texts for one OR MORE endpoint/section names, in doc order.
 
-    A metadata `where` filter (not a similarity search) — for extraction we want
-    the endpoint's COMPLETE documentation, and the section is small (~13 chunks).
+    A metadata `where` filter (not a similarity search). Accepts a single name or a
+    list; for several sections we use Chroma's `$in` operator.
     """
-    data = vectorstore.get(
-        where={"endpoint_section": endpoint_section},
-        include=["documents", "metadatas"],
-    )
+    if isinstance(section_names, str):
+        section_names = [section_names]
+    if not section_names:
+        return []
+
+    if len(section_names) == 1:
+        where = {"endpoint_section": section_names[0]}
+    else:
+        where = {"endpoint_section": {"$in": section_names}}
+
+    data = vectorstore.get(where=where, include=["documents", "metadatas"])
     rows = list(zip(data.get("documents", []), data.get("metadatas", [])))
     rows.sort(key=lambda r: (r[1] or {}).get("chunk_index", 0))
     return [doc for doc, _ in rows]
+
+
+# Backwards-compatible alias (older callers used get_endpoint_chunks for one section).
+def get_endpoint_chunks(vectorstore, endpoint_section):
+    return get_section_chunks(vectorstore, endpoint_section)

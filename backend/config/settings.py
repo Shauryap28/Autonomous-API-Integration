@@ -60,3 +60,5 @@ FORCE_FAILURE = False
 # guesses. A toggle resolves that rather than picking one extreme.
 CONFIRM_ENDPOINT = True
 SELECT_MAX_OUTPUT_TOKENS = 1024   # section names + 3 candidates — a small response
+# --- Extraction context --- heading:
+GLOBAL_CONTEXT_MAX_CHUNKS = 8

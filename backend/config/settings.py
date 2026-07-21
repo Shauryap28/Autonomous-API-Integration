@@ -62,3 +62,14 @@ CONFIRM_ENDPOINT = True
 SELECT_MAX_OUTPUT_TOKENS = 1024   # section names + 3 candidates — a small response
 # --- Extraction context --- heading:
 GLOBAL_CONTEXT_MAX_CHUNKS = 8
+
+# --- Database (Phase 4.2) ---
+# Read from .env — the connection string NEVER appears in code, and is NEVER
+# passed into the sandbox. Only the trusted backend (backend/db/persist.py) uses it.
+DB_URL = os.getenv("DB_URL")
+
+# How to derive each record's stable identifier for idempotent upserts:
+#   "derived" -> first ID-like field (id, name, slug, ...), else a content hash
+#   "llm"     -> ask the LLM which field is the stable identifier (one extra call)
+# A/B these with the run-twice test: correct keys mean the row count does NOT grow.
+KEY_STRATEGY = "derived"

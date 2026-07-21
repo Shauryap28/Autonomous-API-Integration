@@ -1,18 +1,18 @@
 """
-graph — the LangGraph state machine (Piece 2: now CYCLIC).
+graph — the LangGraph state machine.
 
     START -> generate_code -> execute -> <route_result>
                                  ^            |
-                                 |            +-- success           -> END
+                                 |            +-- success           -> persist_and_verify -> END
                                  |            +-- retries exhausted -> END (failed)
                                  |            +-- retry -> diagnose_and_fix --+
-                                 +---------------------------------------------+
+                                 +-----------------------------------------------+
 
-The cycle (execute -> diagnose_and_fix -> execute) is the self-healing loop. It is
-impossible with a linear chain — this is precisely why LangGraph is here.
+execute            = Docker sandbox: fetches, holds NO DB credentials
+persist_and_verify = trusted backend: validates + writes to Postgres
 
-The vectorstore is injected via a closure (see make_diagnose_node), never stored in
-state: state is serialized into every checkpoint, so it holds DATA, not connections.
+Live resources (vectorstore) and setup context (source/endpoint) are injected via
+closures, never stored in state — state is serialized into every checkpoint.
 """
 from langgraph.graph import END, START, StateGraph
 
@@ -21,32 +21,33 @@ from backend.agent.nodes import (
     generate_code_node,
     execute_node,
     make_diagnose_node,
+    make_persist_node,
     route_result,
 )
 
 
-def build_graph(vectorstore, endpoint_section):
+def build_graph(vectorstore, endpoint_section, source):
     builder = StateGraph(AgentState)
 
     builder.add_node("generate_code", generate_code_node)
     builder.add_node("execute", execute_node)
     builder.add_node("diagnose_and_fix", make_diagnose_node(vectorstore, endpoint_section))
+    builder.add_node("persist_and_verify", make_persist_node(source, endpoint_section))
 
     builder.add_edge(START, "generate_code")
     builder.add_edge("generate_code", "execute")
 
-    # The conditional edge: the agent's decision point.
     builder.add_conditional_edges(
         "execute",
         route_result,
         {
-            "success": END,
+            "success": "persist_and_verify",
             "retry": "diagnose_and_fix",
             "give_up": END,
         },
     )
 
-    # ...and the edge that closes the loop.
     builder.add_edge("diagnose_and_fix", "execute")
+    builder.add_edge("persist_and_verify", END)
 
     return builder.compile()

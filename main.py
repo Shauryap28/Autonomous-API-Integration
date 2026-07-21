@@ -1,16 +1,14 @@
 """
-main.py — docs URL + goal -> the agent does the rest.
+main.py — docs URL + goal -> comprehend -> generate -> run (sandboxed) -> persist.
 
   SETUP (once):
-    fetch -> chunk -> SELECT ENDPOINT (LLM proposes, human confirms)
-          -> IDENTIFY GLOBAL SECTIONS (pagination/auth documented separately?)
-          -> embed -> store -> extract the ApiSchema (endpoint + global context)
-  GRAPH (loops):
-    generate_code -> execute -> [success | diagnose_and_fix -> execute -> ...]
+    fetch -> chunk -> select endpoint -> identify global sections
+          -> embed -> store -> extract ApiSchema
+  GRAPH (loops, then persists):
+    generate_code -> execute -> [diagnose_and_fix -> execute ...] -> persist_and_verify
 
 Run from the repo root:
     python main.py
-    python main.py <docs-url-or-file>
     python main.py <docs-url-or-file> "your natural-language goal"
 """
 import json
@@ -55,11 +53,11 @@ def main():
         print("  !! thin — likely a JS-rendered shell. Save as PDF and pass the file path.")
         return
 
-    docs = chunk(r.text, _doc_name_from(src))
+    source = _doc_name_from(src)
+    docs = chunk(r.text, source)
     sections = _section_names(docs)
     print(f"chunk:  {len(docs)} chunks across {len(sections)} sections")
 
-    # --- select the target endpoint (deny early if impossible) ---
     print("select: matching your goal to a documentation section...")
     result = select_endpoint(goal, sections)
     target_endpoint = confirm_endpoint(result, sections)
@@ -68,15 +66,11 @@ def main():
         return
     print(f"target: {target_endpoint}")
 
-    # --- identify GLOBAL sections (pagination/auth documented separately?) ---
     global_sections = identify_global_sections(sections, exclude=target_endpoint)
-    if global_sections:
-        print(f"global: also reading shared sections -> {', '.join(global_sections)}")
-    else:
-        print("global: none (this doc documents concerns per-endpoint)")
+    print(f"global: {', '.join(global_sections)}" if global_sections
+          else "global: none (this doc documents concerns per-endpoint)")
     print()
 
-    # --- embed + store + extract ---
     print("embed:  loading BGE-small + embedding chunks...")
     vectorstore = get_vectorstore(get_embeddings())
     clear(vectorstore)
@@ -97,13 +91,16 @@ def main():
         "error_history": [],
         "status": "running",
         "fetched_data": None,
+        "rows_upserted": None,
+        "rows_for_endpoint": None,
+        "persist_error": None,
     }
 
     backend = "Docker sandbox" if settings.USE_SANDBOX else "local subprocess"
     print(f"--- agent graph (execution via {backend}"
           f"{'; FORCE_FAILURE on' if settings.FORCE_FAILURE else ''}) ---")
 
-    graph = build_graph(vectorstore, target_endpoint)
+    graph = build_graph(vectorstore, target_endpoint, source)
     final = graph.invoke(initial_state, {"recursion_limit": 50})
 
     print(f"\n=== outcome: {final['status'].upper()} in {final['attempt_number']} attempt(s) ===")
@@ -115,17 +112,18 @@ def main():
             err = str(h["error"]).strip().splitlines()[-1] if h["error"] else "?"
             print(f"  attempt {h['attempt']} (exit {h['exit_code']}): {err[:110]}")
 
-    print("\n----- final script -----")
-    print(final["current_code"])
-    print("------------------------")
+    if final.get("rows_upserted") is not None:
+        print(f"\n--- persistence ---")
+        print(f"  upserted this run     : {final['rows_upserted']}")
+        print(f"  rows for this endpoint: {final['rows_for_endpoint']}   "
+              f"(re-run: this should NOT grow)")
+    elif final.get("persist_error"):
+        print(f"\n--- persistence FAILED ---\n  {final['persist_error']}")
 
     data = final.get("fetched_data")
     if isinstance(data, list):
-        print(f"\n--- result: fetched {len(data)} records; first 2 ---")
-        print(json.dumps(data[:2], indent=2)[:1000])
-    elif final["status"] != "success":
-        print("\n--- last stderr ---")
-        print((final.get("execution_result", {}).get("stderr") or "")[:1000])
+        print(f"\n--- fetched {len(data)} records; first 2 ---")
+        print(json.dumps(data[:2], indent=2)[:800])
 
 
 if __name__ == "__main__":

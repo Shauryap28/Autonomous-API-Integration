@@ -1,12 +1,11 @@
 """
 nodes — the functions that make up the agent graph.
 
-A LangGraph node takes the current state and returns a PARTIAL dict of updates;
-LangGraph merges those back into the state. Nodes stay thin — they call the modules
-we already built (codegen, the sandbox runner, diagnose) and record the result.
+A node takes the state and returns a PARTIAL dict of updates. Nodes stay thin: they
+call the modules we already built and record the result.
 
-Nodes that need a live resource (the vectorstore) are built as CLOSURES in graph.py:
-state holds DATA, never live connections (state is serialized into every checkpoint).
+Nodes needing a live resource (vectorstore, DB context) are built as CLOSURES in
+graph.py — state holds DATA, never live connections (state is serialized per checkpoint).
 """
 import json
 
@@ -15,20 +14,15 @@ from backend.agent.codegen import generate_code as _generate_code
 from backend.agent.schemas import ApiSchema
 from backend.agent.diagnose import diagnose_and_fix
 from backend.sandbox.runner import get_runner
+from backend.db.persist import persist_records
 
 
 def _break_code(code):
-    """FORCE_FAILURE (demo only): corrupt the endpoint path so the API returns a real 404.
-
-    Our GitHub call succeeds first try, so nothing would naturally exercise the loop.
-    This makes the self-heal demonstrable ON DEMAND with a genuine HTTP error from a
-    real API — not a fake/simulated one.
-    """
+    """FORCE_FAILURE (demo only): corrupt the endpoint path so the API returns a real 404."""
     return code.replace("/orgs/", "/org/", 1)
 
 
 def generate_code_node(state):
-    """First attempt: write the fetch script from the schema + goal."""
     schema = ApiSchema.model_validate(state["api_schema"])
     code = _generate_code(schema, state["goal"])
 
@@ -42,7 +36,6 @@ def generate_code_node(state):
 
 
 def execute_node(state):
-    """Run the current script in the sandbox and record the raw result."""
     runner = get_runner()
     result = runner.run_script(state["current_code"])
 
@@ -78,7 +71,6 @@ def make_diagnose_node(vectorstore, endpoint_section):
 
         return {
             "current_code": new_code,
-            # error_history has an APPEND reducer -> this entry is added, not overwritten
             "error_history": [{
                 "attempt": attempt,
                 "error": error_text[:500],
@@ -90,10 +82,38 @@ def make_diagnose_node(vectorstore, endpoint_section):
     return diagnose_node
 
 
+def make_persist_node(source, endpoint):
+    """CLOSURE: source/endpoint are setup context, not agent state.
+
+    Runs in the TRUSTED backend — this is the only place holding DB credentials.
+    """
+
+    def persist_node(state):
+        try:
+            result = persist_records(
+                data=state.get("fetched_data"),
+                source=source,
+                endpoint=endpoint,
+                goal=state["goal"],
+            )
+            print(f"[node] persist_and_verify -> upserted {result['upserted']} record(s); "
+                  f"table now holds {result['rows_for_endpoint']} row(s) for this endpoint")
+            return {
+                "rows_upserted": result["upserted"],
+                "rows_for_endpoint": result["rows_for_endpoint"],
+                "status": "persisted",
+            }
+        except Exception as e:
+            print(f"[node] persist_and_verify -> FAILED: {str(e)[:200]}")
+            return {"persist_error": str(e)[:500], "status": "persist_failed"}
+
+    return persist_node
+
+
 def route_result(state):
     """Conditional edge: where do we go after execute?"""
     if state["status"] == "success":
-        print("[route] success -> END")
+        print("[route] success -> persist_and_verify")
         return "success"
 
     if state["attempt_number"] >= state["max_retries"]:

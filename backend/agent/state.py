@@ -1,39 +1,40 @@
 """
 AgentState — the typed, shared state that flows through the LangGraph state machine.
 
-Every node receives the whole state and returns a PARTIAL dict of just the fields
-it changed; LangGraph merges those updates back in.
+Nodes receive the whole state and return a PARTIAL dict of what they changed;
+LangGraph merges those updates.
 
-Merge rules matter:
-  • plain fields          -> last write wins (overwrite)
-  • Annotated[..., add]   -> APPEND (concatenate) instead of overwrite
+Merge rules:
+  • plain fields        -> last write wins (overwrite)
+  • Annotated[..., add] -> APPEND (concatenate)
 
-`error_history` MUST use the append reducer. Without it, each diagnose step would
-overwrite the record of past failures — and that memory is precisely what stops the
-agent from repeating a fix that already failed.
-
-The FULL schema (including the loop/HITL fields) is defined now, even though Piece 1
-only uses some of it: changing the schema later invalidates saved checkpoints
-(Phase 5), so it's cheaper to get it right up front.
+`error_history` MUST use the append reducer, or each diagnose step would erase the
+record of past failures — and that memory is what stops the agent repeating a fix
+that already failed.
 """
 import operator
 from typing import Annotated, Optional, TypedDict
 
 
 class AgentState(TypedDict):
-    # --- inputs (produced by the one-time comprehension step) ---
+    # --- inputs (from the one-time comprehension step) ---
     goal: str
-    api_schema: dict              # the validated ApiSchema, as a dict
+    api_schema: dict
 
     # --- codegen + execution ---
-    current_code: str             # the latest script attempt
-    execution_result: dict        # {exit_code, stdout, stderr} from the sandbox
+    current_code: str
+    execution_result: dict
 
-    # --- the retry loop (used from Piece 2 on) ---
+    # --- the retry loop ---
     attempt_number: int
     max_retries: int
-    error_history: Annotated[list, operator.add]   # APPENDS — see note above
+    error_history: Annotated[list, operator.add]
 
     # --- outcome ---
-    status: str                   # running | success | failed
-    fetched_data: Optional[list]  # parsed from stdout on success
+    status: str                    # running | success | failed | persisted | persist_failed
+    fetched_data: Optional[list]
+
+    # --- persistence (Phase 4.2) ---
+    rows_upserted: Optional[int]
+    rows_for_endpoint: Optional[int]
+    persist_error: Optional[str]

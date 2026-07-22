@@ -54,7 +54,7 @@ def main():
         return
 
     source = _doc_name_from(src)
-    docs = chunk(r.text, source)
+    docs = chunk(r.text, source, doc_url=src)
     sections = _section_names(docs)
     print(f"chunk:  {len(docs)} chunks across {len(sections)} sections")
 

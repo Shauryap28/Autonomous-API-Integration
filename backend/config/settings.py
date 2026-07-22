@@ -73,3 +73,7 @@ DB_URL = os.getenv("DB_URL")
 #   "llm"     -> ask the LLM which field is the stable identifier (one extra call)
 # A/B these with the run-twice test: correct keys mean the row count does NOT grow.
 KEY_STRATEGY = "derived"
+
+# --- Docs Q&A (frontend) ---
+QA_TOP_K = 8            # chunks retrieved to answer a question about the docs
+QA_MAX_OUTPUT_TOKENS = 1024  # answers stay short

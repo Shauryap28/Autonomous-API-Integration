@@ -2,22 +2,22 @@
 chunker — split fetched doc text into section-aware LangChain Documents.
 
   1. Split at every markdown heading (## / ### / ####) into sections.
-  2. Tag each chunk with its enclosing ENDPOINT (nearest h2 '##'), so retrieval
-     can be scoped to one endpoint and ignore the ~30 others on the same page.
-     (Same metadata-filter idea as MDIS's doc_name scoping — reused one level down.)
+  2. Tag each chunk with its enclosing ENDPOINT (nearest h2 '##'), so retrieval can be
+     scoped to one endpoint and ignore the others on the same page.
   3. A section longer than CHUNK_MAX_CHARS is sub-split with LangChain's
-     RecursiveCharacterTextSplitter (reused, well-tested), not a hand-rolled window.
+     RecursiveCharacterTextSplitter.
   4. No headings at all -> pure recursive splitting fallback.
 
-Output: list[Document] with metadata {doc_name, endpoint_section, section_title,
-chunk_index} — the same Document shape the rest of the pipeline expects.
+Metadata per chunk: {doc_url, doc_name, endpoint_section, section_title, chunk_index}.
+`doc_url` is the precise identifier (doc_name is only the URL's last segment and is NOT
+unique across URLs) — it is what lets us delete or refresh one document's chunks.
 """
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.config import settings
 
-_PAGE = "(page)"  # endpoint_section for content above the first h2
+_PAGE = "(page)"
 
 
 def _heading_level(line):
@@ -31,7 +31,6 @@ def _heading_level(line):
 
 
 def _split_into_sections(text):
-    """Return [(section_title, endpoint_section, body), ...]."""
     sections = []
     title, endpoint, buf = "(intro)", _PAGE, []
     current_h2 = _PAGE
@@ -43,10 +42,9 @@ def _split_into_sections(text):
                 buf = []
             title = line.lstrip()[level:].strip()
             if level <= 1:
-                current_h2 = _PAGE          # page title, not an endpoint
+                current_h2 = _PAGE
             elif level == 2:
-                current_h2 = title          # this heading IS the endpoint
-            # level >= 3 stays under the current h2
+                current_h2 = title
             endpoint = current_h2
         else:
             buf.append(line)
@@ -55,7 +53,7 @@ def _split_into_sections(text):
     return [(t, e, b) for t, e, b in sections if b]
 
 
-def chunk(text, doc_name):
+def chunk(text, doc_name, doc_url=""):
     sections = _split_into_sections(text)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
@@ -67,6 +65,7 @@ def chunk(text, doc_name):
         docs.append(Document(
             page_content=content,
             metadata={
+                "doc_url": doc_url or doc_name,
                 "doc_name": doc_name,
                 "endpoint_section": endpoint_section,
                 "section_title": section_title,

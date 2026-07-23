@@ -1,20 +1,20 @@
 """
-discover.py — generality probe for the comprehension layer.
+discover.py — can this project use this documentation URL?
 
-Fetches + chunks ANY API doc and lists the endpoint sections it found.
-NO LLM, NO embeddings — cheap, free, and it answers one question: does our
-fetch->chunk pipeline generalize beyond GitHub, or is it secretly GitHub-shaped?
+Fetches and chunks any doc (NO LLM, NO embeddings — free and instant) and reports:
+  • a plain verdict: usable / flat / not usable / unreachable
+  • the endpoint sections it found
 
 Run from the repo root:
     python discover.py <url-or-file>
-
-Use the printed endpoint-section names to pick a TARGET_ENDPOINT for main.py.
 """
 import sys
 from collections import Counter
 
 from backend.rag.fetcher import fetch
 from backend.rag.chunker import chunk
+
+_ICON = {"usable": "[OK]  ", "flat": "[WARN]", "not_usable": "[NO]  ", "error": "[FAIL]"}
 
 
 def main():
@@ -26,22 +26,20 @@ def main():
     print(f"Source: {src}\n")
 
     r = fetch(src)
-    print(f"fetch: chars={r.char_count}  headings={r.heading_count}  thin={r.looks_thin}")
-    if r.looks_thin:
-        print("\n!! thin — likely a JS-rendered SPA that returns a shell to requests.")
-        print("   Options: save the page as PDF/HTML and pass the file path, or")
-        print("   find an OpenAPI/Swagger spec or raw-markdown version of the docs.")
+    print(f"{_ICON.get(r.verdict, '')} {r.verdict.upper()}: {r.message}")
+
+    if not r.ok:
         return
 
-    doc_name = src.rstrip("/").split("/")[-1] or src
-    docs = chunk(r.text, doc_name)
+    print(f"       chars={r.char_count:,}  headings={r.heading_count}")
+    docs = chunk(r.text, src.rstrip('/').split('/')[-1] or src,
+                 doc_url=src, content_hash=r.content_hash)
     counts = Counter(d.metadata["endpoint_section"] for d in docs)
 
-    print(f"chunk: {len(docs)} chunks across {len(counts)} endpoint sections\n")
-    print("endpoint sections  (chunks | name):")
+    print(f"\nchunk: {len(docs)} chunks across {len(counts)} sections\n")
+    print("sections  (chunks | name):")
     for name, c in counts.most_common():
-        print(f"  {c:3d} | {name[:72]}")
-    print("\nPick one of these names as TARGET_ENDPOINT in main.py to run the full pipeline.")
+        print(f"  {c:4d} | {name[:70]}")
 
 
 if __name__ == "__main__":

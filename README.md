@@ -2,45 +2,54 @@
 
 An agentic AI system that reads an API's documentation plus a natural-language goal,
 works out which endpoint fits, generates code to fetch the data, runs that code inside an
-isolated sandbox, self-corrects from real HTTP errors, and syncs the result into Postgres.
-Built on a LangGraph cyclic state machine, with a Streamlit interface.
+isolated Docker sandbox, self-corrects from real HTTP errors, and syncs the result into
+PostgreSQL. Built on a LangGraph cyclic state machine, with a Streamlit interface.
 
 This README describes the **current state**, not a change history.
+Design rationale and the full problem log live in [`DESIGN.md`](DESIGN.md).
 
 ---
 
-## Current capability
+## What it does
 
-Give it a docs URL and a plain-English goal. It then:
+Give it a documentation URL and a plain-English goal:
 
-1. **Reads the docs** — fetch, section-aware chunk, embed (BGE-small), index (ChromaDB).
-2. **Picks the endpoint** — an LLM matches the goal against the doc's section list,
-   proposes a ranked top-3 to confirm, or **denies the goal** if no endpoint fits
-   (before spending anything on embedding or codegen).
-3. **Comprehends it** — endpoint-scoped retrieval, plus any **global sections**
-   (pagination/auth documented separately) → a Pydantic-validated `ApiSchema`.
+```
+python main.py https://docs.github.com/en/rest/repos/repos \
+  "List the first 50 public repositories of the 'github' organization."
+```
+
+1. **Reads the docs** — fetch → section-aware chunk → BGE-small embeddings → ChromaDB.
+   Already-indexed docs are reused instantly unless they changed or went stale.
+2. **Picks the endpoint** — an LLM matches the goal against the doc's sections, proposes a
+   ranked top-3 to confirm, or **denies the goal** if nothing fits.
+3. **Comprehends it** — endpoint-scoped retrieval plus any **global sections** (pagination
+   or auth documented separately) → a Pydantic-validated `ApiSchema`, then a sanity check
+   that the schema is based on real endpoint documentation.
 4. **Writes the code** — a runnable `requests` script from the schema + goal.
-5. **Runs it safely** — in a Docker container: no host filesystem, capped memory/CPU,
-   read-only filesystem, non-root user, hard timeout, **no database credentials**.
+5. **Runs it safely** — in a container with no host filesystem, capped memory/CPU, a
+   read-only filesystem, a non-root user, a hard timeout, and **no database credentials**.
 6. **Fixes itself** — on failure it reads the real error, re-queries the docs *using that
    error*, rewrites the script, and retries (bounded, remembering every past attempt).
-7. **Persists the data** — a **trusted backend** outside the sandbox structurally
-   validates the JSON and upserts it into Postgres as JSONB, then verifies the row count.
+7. **Persists the data** — a **trusted process outside the sandbox** validates the JSON
+   structurally and upserts it into Postgres as JSONB, then verifies the row count.
    Re-running never duplicates.
 
-You can drive all of this from a **browser UI** or the CLI.
+Not yet implemented: human-in-the-loop escalation, checkpoint/resume, multi-page
+pagination, write operations.
 
-Not yet implemented: human-in-the-loop escalation, checkpoint/resume, doc caching.
+---
 
-### Validated on
-- **GitHub REST API** (`/orgs/{org}/repos`) — page pagination, top-level array. 50 repos
-  fetched and persisted. With the endpoint path deliberately corrupted, the agent gets a
-  real **404**, retrieves the relevant docs, corrects the path, succeeds on attempt 2.
-- **PokéAPI** (`/pokemon`) — offset/limit pagination (documented in a *separate* global
-  section) and records nested under `results`. 50 Pokémon fetched and persisted.
-- **Goal denial** — asked to "delete all repositories and drop the database", the selector
-  refuses rather than forcing a match onto the unrelated "Delete a repository".
-- **Idempotency** — the same goal run twice leaves the row count unchanged (50, not 100).
+## Validated on
+
+| API | What it exercises | Result |
+|---|---|---|
+| **GitHub REST** `/orgs/{org}/repos` | page pagination, top-level array | 50 repos fetched + persisted |
+| **PokéAPI** `/pokemon` | offset/limit pagination documented in a *separate* section; records nested under `results` | 50 Pokémon fetched + persisted |
+| **Self-healing** | endpoint path deliberately corrupted | real 404 → diagnosed → corrected → success on attempt 2 |
+| **Goal denial** | "delete all repositories and drop the database" | refused, with reasoning; no wasted calls |
+| **Idempotency** | same goal run twice | row count unchanged (50, not 100) |
+| **Hallucination guard** | Open Library's navigation page | schema flagged as not-real before any run |
 
 ---
 
@@ -51,28 +60,24 @@ streamlit run frontend/streamlit_app.py
 ```
 
 **Explore the docs**
-- **Endpoint browser** — every section the doc defines, with chunk counts and previews.
-  Free: no LLM, no embedding, just the chunker's output.
-- **Ask the documentation** — RAG Q&A over the docs so you can understand an API before
-  writing a goal. Optionally scope a question to one section (which scopes both the
-  retrieval *and* the prompt), and expand **Sources** to see exactly which chunks the
-  answer came from.
+- **Endpoint browser** — every section with chunk counts and previews. Free: no LLM, no
+  embedding, just the chunker's output.
+- **Ask the documentation** — RAG Q&A so you can understand an API *before* writing a
+  goal. Scope a question to one section (which scopes both the retrieval and the prompt),
+  and expand **Sources** to see which chunks produced the answer.
 
 **Run a goal**
-- Enter a goal → see the ranked endpoint candidates with confidence and reasoning → click
-  one → see **what the agent understood** (method, URL, auth, pagination, where the
-  records live, full schema JSON).
-- **Run the agent** → the trace streams in node by node
-  (`generate_code → execute → diagnose_and_fix → execute → persist_and_verify`).
-- Results in four tabs: **Trace**, **Generated code** (downloadable), **Error history**
-  (each failed attempt with its real error), **Data** (the fetched records + row counts).
+- Goal → ranked candidates with confidence and reasoning → click one → **what the agent
+  understood** (method, URL, auth, pagination, where records live, full schema JSON, plus
+  a warning if the schema looks invented).
+- **Run the agent** → the trace streams node by node → results in four tabs: **Trace**,
+  **Generated code** (downloadable), **Error history**, **Data**.
 
-**Vector store panel** — every indexed document with its chunk count, delete one document,
-or clear the whole store.
+**Vector store panel** — every indexed document with its age, click to load instantly,
+delete one, or clear the store.
 
-**Settings** — toggle the Docker sandbox, flip **Force failure** to demonstrate the
-self-healing loop on demand, and adjust max retries. (The record-key strategy is shown
-read-only on purpose: changing it invalidates idempotency against already-stored rows.)
+**Settings** — Docker sandbox on/off, **Force failure** to demo the self-healing loop,
+max retries.
 
 ---
 
@@ -81,27 +86,28 @@ read-only on purpose: changing it invalidates idempotency against already-stored
 ```
 docs URL  +  natural-language goal
         |
-   [ SETUP — runs once ]
-   fetcher -> chunker -> section list
-                            |
-                    select_endpoint (LLM: top-3 or DENY)  <-- human confirms
-                    identify_global_sections (pagination/auth documented separately?)
-                            |
-             embeddings -> vectorstore -> endpoint-scoped + global retrieval
-                            |
-                     extractor -> ApiSchema (validated)
+   [ SETUP — runs once per document ]
+   fetcher ──> verdict: usable / flat / not usable / unreachable
+        |
+   doc_cache ──> hash + age → reuse the index, or re-chunk and re-embed
+        |
+   chunker ──> embeddings ──> vectorstore (a persistent library of many docs)
+        |
+   select_endpoint (LLM: top-3 or DENY)          <── human confirms
+   identify_global_sections (pagination/auth documented separately?)
+        |
+   extractor ──> ApiSchema ──> schema_check (is this real documentation?)
         |
    [ AGENT GRAPH — LangGraph, cyclic ]
-   START -> generate_code -> execute -> <route_result>
-                                ^            |
-                                |            +-- success           -> persist_and_verify -> END
-                                |            +-- retries exhausted -> END (failed)
-                                |            +-- retry -> diagnose_and_fix --+
-                                +----------------------------------------------+
+   START ─> generate_code ─> execute ─> <route_result>
+                                ^            ├── success            ─> persist_and_verify ─> END
+                                │            ├── retries exhausted  ─> END (failed)
+                                │            └── retry ─> diagnose_and_fix ──┐
+                                └────────────────────────────────────────────┘
 
-   execute            = Docker sandbox — fetches; holds the API key, NO DB credentials
+   execute            = Docker sandbox — holds the API key, NO DB credentials
    diagnose_and_fix   = real error + docs retrieved USING that error + error_history
-   persist_and_verify = TRUSTED host process — holds DB_URL, validates + upserts
+   persist_and_verify = trusted host process — holds DB_URL, validates + upserts
 
    backend/llm.py underlies every LLM step: Gemini primary, Groq fallback on 429/503.
 ```
@@ -110,23 +116,93 @@ docs URL  +  natural-language goal
 
 ## Data model
 
-One row per fetched record, stored whole in a `JSONB` column — any API's shape is accepted
-with no per-API table design.
+One row per fetched record, stored whole in a `JSONB` column, so any API's shape is
+accepted with no per-API table design.
 
 ```sql
 fetched_records (
-    id, source, endpoint, record_key, goal, record JSONB, fetched_at,
+    id BIGSERIAL PRIMARY KEY,
+    source      TEXT,        -- which API
+    endpoint    TEXT,        -- which endpoint produced it
+    record_key  TEXT,        -- which record (id -> name -> ... -> content hash)
+    goal        TEXT,        -- provenance (NOT part of identity)
+    record      JSONB,       -- the record, unmodified
+    fetched_at  TIMESTAMPTZ,
     UNIQUE (source, endpoint, record_key)
 )
 ```
 
 Identity is `(source, endpoint, record_key)` — deliberately **not** the goal, so the same
-record fetched by "first 50" and "first 100" updates in place rather than duplicating.
-`record_key` is derived from the record (`id` → `name` → … → content hash).
+record fetched by "first 50" and "first 100" updates in place instead of duplicating.
+Idempotency is enforced by the database (`ON CONFLICT DO UPDATE`), not by application code.
 
 ```sql
-SELECT record->>'name', record->>'language' FROM fetched_records WHERE source = 'repos';
+SELECT record->>'name', record->>'language' FROM fetched_records WHERE source = 'docs.github.com/repos';
 ```
+
+---
+
+## Setup
+
+**Prerequisites:** Python 3.11+, Docker Desktop, PostgreSQL.
+
+```bash
+git clone <repo> && cd autonomous-api-integration-engine
+python -m venv .venv
+.venv\Scripts\Activate.ps1          # Windows   (macOS/Linux: source .venv/bin/activate)
+pip install -r requirements.txt
+```
+
+**1. Keys and database** — create `.env` in the repo root:
+```
+GEMINI_API_KEY=your_key_here
+GROQ_API_KEY=your_key_here
+DB_URL=postgresql://USER:PASSWORD@localhost:5432/YOUR_DB
+```
+`.env` is gitignored — secrets never enter the code, and never enter the sandbox.
+
+**2. Create the database** (the table is created automatically on first run):
+```sql
+CREATE DATABASE "Autonomous_Api_db";
+```
+
+**3. Build the sandbox image** (once):
+```bash
+docker build -t aaie-sandbox ./sandbox_image
+```
+
+**4. Verify:**
+```bash
+python test_sandbox_isolation.py     # proves the sandbox's safety guarantees
+python discover.py https://docs.github.com/en/rest/repos/repos
+```
+
+The first run downloads the BGE-small embedding model (~130 MB).
+
+---
+
+## Usage
+
+```bash
+streamlit run frontend/streamlit_app.py            # the UI
+
+python main.py                                     # defaults (GitHub repos)
+python main.py <docs-url> "your goal in English"
+python main.py <docs-url> "your goal" --reindex    # ignore the doc cache
+
+python discover.py <docs-url>                      # can this project use this URL?
+python test_sandbox_isolation.py                   # sandbox safety checks
+```
+
+**To see the self-healing loop**, set `FORCE_FAILURE = True` in `settings.py` (or toggle
+it in the UI sidebar): the first generated script is deliberately corrupted, producing a
+genuine 404 the agent must diagnose and repair.
+
+**Documentation sources that work:** server-rendered pages. Verified —
+`docs.github.com/en/rest/repos/repos`, `pokeapi.co/docs/v2`, `open-meteo.com/en/docs`,
+`restcountries.com`, `jsonplaceholder.typicode.com`.
+JavaScript-rendered doc sites (Jikan, SpaceX, NASA, TheCatAPI) return an empty shell to a
+plain HTTP request and are reported as unusable — see *Known limitations*.
 
 ---
 
@@ -134,102 +210,75 @@ SELECT record->>'name', record->>'language' FROM fetched_records WHERE source = 
 ```
 autonomous-api-integration-engine/
 ├── backend/
-│   ├── llm.py                  # LLM seam: Gemini primary + Groq fallback
+│   ├── llm.py                    # LLM seam: Gemini primary + Groq fallback
 │   ├── agent/
-│   │   ├── selector.py         # goal -> endpoint section (top-3 / deny)
-│   │   ├── global_sections.py  # which sections document pagination/auth globally
-│   │   ├── state.py            # AgentState (error_history has an append reducer)
-│   │   ├── graph.py            # the cyclic StateGraph
-│   │   ├── nodes.py            # generate / execute / diagnose / persist / route
-│   │   ├── codegen.py          # schema + goal -> Python fetch script
-│   │   ├── diagnose.py         # error + relevant docs + history -> corrected script
-│   │   └── schemas.py          # ApiSchema — the comprehension contract
+│   │   ├── selector.py           # goal -> endpoint section (top-3 / deny)
+│   │   ├── global_sections.py    # sections documenting pagination/auth globally
+│   │   ├── schema_check.py       # is the extracted schema based on real docs?
+│   │   ├── state.py              # AgentState (error_history has an append reducer)
+│   │   ├── graph.py              # the cyclic StateGraph
+│   │   ├── nodes.py              # generate / execute / diagnose / persist / route
+│   │   ├── codegen.py            # schema + goal -> Python fetch script
+│   │   ├── diagnose.py           # error + relevant docs + history -> corrected script
+│   │   └── schemas.py            # ApiSchema — the comprehension contract
 │   ├── rag/
-│   │   ├── fetcher.py chunker.py embeddings.py vectorstore.py
-│   │   ├── retriever.py extractor.py
-│   │   └── qa.py               # Q&A over the docs (optionally section-scoped)
-│   ├── db/persist.py           # TRUSTED: validate -> upsert -> verify (holds DB_URL)
-│   ├── sandbox/                # docker_runner, local_runner, runner (USE_SANDBOX)
-│   └── config/settings.py      # single source of truth
-├── frontend/streamlit_app.py   # the UI (calls backend functions only — no logic here)
-├── sandbox_image/Dockerfile    # python:3.11-slim + requests, non-root
-├── data/chroma_db/             # vector store (gitignored — generated)
-├── main.py                     # CLI entry point / primary test harness
-├── discover.py                 # list a doc's endpoint sections (no LLM)
-├── test_sandbox_isolation.py   # sandbox safety checks
-├── requirements.txt
-└── .env                        # GEMINI_API_KEY, GROQ_API_KEY, DB_URL
+│   │   ├── fetcher.py            # URL/PDF -> clean text + usability verdict + hash
+│   │   ├── chunker.py            # section-aware -> LangChain Documents
+│   │   ├── doc_cache.py          # freshness: content hash + TTL
+│   │   ├── doc_identity.py       # human-readable document names
+│   │   ├── embeddings.py vectorstore.py retriever.py
+│   │   ├── extractor.py          # chunks -> ApiSchema
+│   │   └── qa.py                 # Q&A over the docs (optionally section-scoped)
+│   ├── db/persist.py             # TRUSTED: validate -> upsert -> verify (holds DB_URL)
+│   ├── sandbox/                  # docker_runner, local_runner, runner (USE_SANDBOX)
+│   └── config/settings.py        # single source of truth
+├── frontend/streamlit_app.py     # the UI (calls backend functions only)
+├── sandbox_image/Dockerfile      # python:3.11-slim + requests, non-root
+├── data/chroma_db/               # vector store (gitignored — generated)
+├── main.py discover.py test_sandbox_isolation.py
+├── requirements.txt  .env  README.md  DESIGN.md
 ```
 
 ---
 
-## Setup
+## Configuration (`backend/config/settings.py`)
 
-```bash
-python -m venv .venv
-.venv\Scripts\Activate.ps1            # Windows  (macOS/Linux: source .venv/bin/activate)
-pip install -r requirements.txt
-```
-
-`.env`:
-```
-GEMINI_API_KEY=...
-GROQ_API_KEY=...
-DB_URL=postgresql://USER:PASSWORD@localhost:5432/YOUR_DB
-```
-
-Also required:
-- **Docker Desktop** running, with the sandbox image built once:
-  `docker build -t aaie-sandbox ./sandbox_image`
-- **PostgreSQL** reachable at `DB_URL` (the table is created automatically).
-
-## Run
-
-```bash
-streamlit run frontend/streamlit_app.py            # the UI
-python main.py <docs-url> "your goal in English"   # the CLI
-python discover.py <docs-url>                      # list a doc's sections (no LLM)
-python test_sandbox_isolation.py                   # prove the sandbox guarantees
-```
-
----
-
-## Configuration (settings.py)
-
-| Setting | Purpose |
-|---|---|
-| `KEY_STRATEGY` | `"derived"` (default) or `"llm"` — how each record's identity is chosen |
-| `CONFIRM_ENDPOINT` | CLI: ask before using the top endpoint match |
-| `MAX_RETRIES` | bounded retry budget for the self-healing loop |
-| `FORCE_FAILURE` | demo lever: corrupt the first script to force a real error |
-| `USE_SANDBOX` | `True` = Docker sandbox; `False` = local execution fallback |
-| `SANDBOX_*` | image, memory/CPU caps, timeout, read-only filesystem |
-| `GLOBAL_CONTEXT_MAX_CHUNKS` | cap on global-section chunks added to extraction |
-| `QA_TOP_K`, `QA_MAX_OUTPUT_TOKENS` | docs Q&A retrieval depth and answer length |
-| `*_MAX_OUTPUT_TOKENS` | LLM output budgets (selection / extraction / codegen) |
+| Setting | Default | Purpose |
+|---|---|---|
+| `DOC_TTL_DAYS` | 30 | how long an unchanged indexed doc stays fresh |
+| `KEY_STRATEGY` | `derived` | how a record's identity key is chosen (`derived` / `llm`) |
+| `CONFIRM_ENDPOINT` | True | CLI: confirm the selected endpoint before continuing |
+| `MAX_RETRIES` | 5 | bounded retry budget for the self-healing loop |
+| `FORCE_FAILURE` | False | demo lever: corrupt the first script to force a real error |
+| `USE_SANDBOX` | True | Docker sandbox vs. local execution fallback |
+| `SANDBOX_MEM_LIMIT` / `SANDBOX_CPUS` / `SANDBOX_TIMEOUT` | 256m / 0.5 / 30s | container caps |
+| `GLOBAL_CONTEXT_MAX_CHUNKS` | 8 | cap on global-section chunks added to extraction |
+| `QA_TOP_K` | 8 | chunks retrieved per documentation question |
+| `CHUNK_MAX_CHARS` / `CHUNK_SIZE` / `CHUNK_OVERLAP` | 1200 / 800 / 100 | chunking |
+| `*_MAX_OUTPUT_TOKENS` | — | LLM output budgets per task |
 
 ---
 
 ## Known limitations
 
-- **Structural questions in Q&A** ("how many endpoints does this API have?") answer poorly:
-  the answer isn't in any chunk, it comes from the section list — which the endpoint
-  browser already displays. To be revisited with real failure data in the eval phase.
-- **No DB-level schema enforcement.** JSONB accepts any valid JSON; we validate the
-  *structure* of the batch, not per-record fields — strictness traded for generality.
-- **Changing `KEY_STRATEGY` invalidates idempotency** against already-stored rows (the
-  identity key changes, so old rows no longer collide). Truncate the table when switching.
-- **The Groq fallback can't serve large prompts** (8000 TPM vs. ~9700-token extraction),
-  so when Gemini is rate-limited the fallback fails on the heaviest requests.
-- **Provider fallback is not deterministic** — Gemini and Groq can select different
-  endpoints on identical input.
+These are measured and deliberately unfixed — see `DESIGN.md` for the evidence and the
+trigger that would justify fixing each.
+
 - **Egress is not restricted.** The sandbox blocks host filesystem access and caps
-  resources, but bridge networking lets the container reach any host. Phase 7.
-- **Tables are flattened, not parsed**; the **PDF input path is untested**. Phase 4.5.
+  resources, but bridge networking lets the container reach any host.
+- **Most modern API doc sites are JavaScript-rendered** and cannot be read by the HTML
+  path. OpenAPI/Swagger support is the highest-value planned fix.
+- **Tables are flattened, not parsed**, and the **PDF path is untested**.
+- **No DB-level schema enforcement** — JSONB accepts any valid JSON; we validate the
+  batch's structure, not per-record fields.
+- **The Groq fallback cannot serve large prompts** (8000 TPM vs. ~9700-token extraction),
+  so it fails on exactly the heaviest requests.
+- **Provider fallback is non-deterministic** — Gemini and Groq can select different
+  endpoints on identical input.
+- **Changing `KEY_STRATEGY` invalidates idempotency** for already-stored rows.
 - **Self-correction is proven against an injected error**, not yet a spontaneous one.
 - **Single-page pagination only**; multi-page "fetch all" with backoff is deferred.
-- **Docs are re-embedded per session** — doc caching is the next phase.
-- **UI settings toggles are session-only** and don't write back to `settings.py`.
+- **Documentation is not versioned** — re-indexing replaces the previous version.
 
 ---
 
@@ -237,16 +286,16 @@ python test_sandbox_isolation.py                   # prove the sandbox guarantee
 
 | Phase | Capability | Status |
 |---|---|---|
-| 1 | Docs -> validated `ApiSchema` | done |
-| 2 | Schema -> generated script -> real fetch | done |
+| 1 | Docs → validated `ApiSchema` | done |
+| 2 | Schema → generated script → real fetch | done |
 | 3 | Docker sandbox (contained execution) | done |
 | 4 | Self-healing loop (LangGraph cyclic graph) | done |
 | 4.1 | Endpoint selection from the goal (top-3 / deny / confirm) | done |
-| 4.2 | `persist_and_verify` — Postgres JSONB sync, idempotent upserts | done |
-| 4.4 | Streamlit UI — explore, ask, run, inspect; vector-store management | done |
-| 4.3 | Doc caching (content hash + freshness window; stop re-embedding) | next |
-| 4.5 | Comprehension hardening: table parsing, PDF heading detection | planned |
-| 5 | HITL: on repeated failure, offer to switch endpoint; checkpoint/resume | planned |
-| 6 | Eval harness (goals x APIs, scored) + demo polish | planned |
+| 4.2 | `persist_and_verify` — Postgres JSONB, idempotent upserts | done |
+| 4.3 | Doc caching, fetchability verdicts, schema sanity check | done |
+| 4.4 | Streamlit interface | done |
+| 4.5 | OpenAPI/Swagger input, table parsing, PDF headings | planned |
+| 5 | HITL: on repeated failure offer a different endpoint; checkpoint/resume | planned |
+| 6 | Eval harness (goals × APIs, scored) | planned |
 | 7 | AWS deployment & hardening; egress lockdown | planned |
 | 8 | Safe write operations (idempotency, HITL-before-mutate) | future |

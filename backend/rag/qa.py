@@ -5,13 +5,18 @@ Lets someone explore an API's docs ("how does auth work?") BEFORE committing to 
 so goal-drafting is informed rather than guesswork.
 
 Two retrieval scopes, because questions come in two shapes:
-  • unscoped  -> semantic search across the whole document. Good for "how does X work?"
-  • scoped    -> restricted to ONE section via the endpoint_section metadata filter.
-                 Good for "summarize the Pokémon (group) endpoint", where an unscoped
-                 search returns 5 chunks from anywhere and misses the section entirely.
+  • unscoped -> semantic search across the whole document. Good for "how does X work?"
+  • scoped   -> restricted to ONE section via the endpoint_section metadata filter.
+                Good for "summarize this endpoint", where an unscoped search returns
+                chunks from anywhere and misses the section entirely.
 
-The scoped path reuses exactly the metadata-filter pattern that fixed cross-endpoint
-contamination in Phase 1 — same idea, applied to Q&A.
+The scoped path reuses the same metadata-filter pattern that fixed cross-endpoint
+contamination in Phase 1.
+
+IMPORTANT: the scope is passed to the PROMPT as well as the retriever. Filtering alone
+tells the retriever what to fetch but leaves the model guessing — asked "summarize this
+endpoint" it would reply "which endpoint?" because it cannot see that the excerpts were
+deliberately narrowed to one section.
 
 Returns the answer AND the retrieved chunks, so the UI can show its sources.
 """
@@ -19,7 +24,7 @@ from backend.config import settings
 from backend.llm import complete_text
 
 _PROMPT = """You are answering questions about an API, using ONLY the documentation excerpts below.
-
+{scope_line}
 QUESTION: {question}
 
 DOCUMENTATION EXCERPTS:
@@ -29,6 +34,12 @@ Answer concisely and factually from the excerpts. If the excerpts do not contain
 answer, say so plainly rather than guessing. Where useful, mention the endpoint or
 section name the answer comes from.
 """
+
+_SCOPE_LINE = (
+    '\nThe user has narrowed this question to the documentation section "{section}". '
+    "Every excerpt below comes from that section, so treat vague references such as "
+    '"this endpoint" or "this section" as referring to "{section}".\n'
+)
 
 
 def _build_filter(doc_url, section):
@@ -47,7 +58,7 @@ def _build_filter(doc_url, section):
 
 
 def answer_question(vectorstore, question, doc_url=None, section=None, k=None):
-    """Return (answer, sources). `section` scopes retrieval to one endpoint section."""
+    """Return (answer, sources). `section` scopes BOTH retrieval and the prompt."""
     k = k or settings.QA_TOP_K
     search_kwargs = {"k": k}
     where = _build_filter(doc_url, section)
@@ -66,6 +77,10 @@ def answer_question(vectorstore, question, doc_url=None, section=None, k=None):
         f"{h.page_content}"
         for h in hits
     )
-    prompt = _PROMPT.format(question=question, context=context[:14000])
+    prompt = _PROMPT.format(
+        scope_line=_SCOPE_LINE.format(section=section) if section else "",
+        question=question,
+        context=context[:14000],
+    )
     answer = complete_text(prompt, settings.QA_MAX_OUTPUT_TOKENS)
     return answer, hits

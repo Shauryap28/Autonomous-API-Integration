@@ -12,7 +12,8 @@ DESIGN NOTES
 - The UI holds NO logic: every action calls an existing backend/ function.
   main.py stays the primary test harness; this is a second entry point.
 - Cost ordering: browsing endpoints is free (filter + slice on already-chunked text).
-  Embedding happens lazily on first real need (Q&A or a run) via ensure_indexed().
+  Documents are CACHED: an already-indexed, unchanged, in-date doc is reused instantly
+  instead of being re-embedded (see backend/rag/doc_cache.py).
 """
 import json
 import sys
@@ -27,12 +28,17 @@ from backend.rag.fetcher import fetch
 from backend.rag.chunker import chunk
 from backend.rag.embeddings import get_embeddings
 from backend.rag.vectorstore import (
-    get_vectorstore, add_documents, count, clear, list_docs, delete_doc, has_doc,
+    get_vectorstore, count, clear, list_docs, delete_doc,
+    reindex_doc, get_doc_sections,
 )
+from backend.rag import doc_cache
+from backend.rag.vectorstore import get_section_chunks
 from backend.rag.qa import answer_question
 from backend.rag.extractor import extract_api_schema
 from backend.agent.selector import select_endpoint
 from backend.agent.global_sections import identify_global_sections
+from backend.agent.schema_check import check_schema
+from backend.rag.doc_identity import doc_display_name
 from backend.agent.graph import build_graph
 
 st.set_page_config(page_title="API Integration Engine", page_icon="🔌", layout="wide")
@@ -64,6 +70,9 @@ DEFAULTS = {
     "qa_answer": None,
     "qa_sources": [],
     "qa_scope": "All sections",
+    "cache_state": "",
+    "cache_meta": None,
+    "fresh_hash": "",
 }
 
 
@@ -84,10 +93,6 @@ vs = cached_vectorstore()
 
 # ----------------------------------------------------------------- helpers
 
-def doc_name_from(src):
-    return src.rstrip("/").split("/")[-1] or src
-
-
 def section_names(docs):
     counts = {}
     for d in docs:
@@ -96,18 +101,36 @@ def section_names(docs):
     return [(name, n) for name, n in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
-def ensure_indexed():
-    """Embed this doc only if it isn't in the store already (idempotent).
+def load_document(src, force_reindex=False):
+    """Fetch -> decide freshness -> index only if needed. Returns True on success.
 
-    Browsing costs nothing; you pay the embedding cost the first time you actually
-    need semantics (Q&A or a run). has_doc() makes repeat calls free — a preview of
-    the doc-caching phase.
+    Cheap-first: fetching+hashing costs ~1 s; embedding costs 10-30 s. So we always
+    fetch (to detect content changes) but embed only when the cache says we must.
     """
-    src = st.session_state.doc_src
-    if has_doc(vs, src):
+    fr = fetch(src)
+    st.session_state.fetch_result = fr
+    if not fr.ok:
+        st.session_state.stage = 0
         return False
-    with st.spinner(f"Indexing {len(st.session_state.docs)} chunks (first time for this doc)..."):
-        add_documents(vs, st.session_state.docs)
+
+    state, meta = doc_cache.check_cache(vs, src, fr.content_hash)
+    if force_reindex and state == doc_cache.FRESH:
+        state = doc_cache.STALE
+
+    if doc_cache.should_reindex(state):
+        with st.spinner("Indexing this document (embedding chunks)..."):
+            docs = chunk(fr.text, doc_display_name(src),
+                         doc_url=src, content_hash=fr.content_hash)
+            reindex_doc(vs, src, docs)          # delete-then-add, never append
+    # else: reuse the existing index — instant
+
+    st.session_state.update(
+        doc_src=src, doc_name=doc_display_name(src),
+        sections=get_doc_sections(vs, src),
+        cache_state=state, cache_meta=meta, fresh_hash=fr.content_hash,
+        stage=1, selection=None, target_endpoint="", schema=None,
+        trace=[], final_state=None, qa_answer=None,
+    )
     return True
 
 
@@ -135,22 +158,17 @@ with st.sidebar:
     )
 
     if st.button("Load docs", type="primary", use_container_width=True):
-        with st.spinner("Fetching and chunking..."):
-            fr = fetch(src_input)
-        st.session_state.fetch_result = fr
-        if fr.looks_thin:
-            st.session_state.stage = 0
-            st.session_state.docs = None
-        else:
-            name = doc_name_from(src_input)
-            docs = chunk(fr.text, name, doc_url=src_input)
-            st.session_state.update(
-                doc_src=src_input, doc_name=name, docs=docs,
-                sections=section_names(docs), stage=1,
-                selection=None, target_endpoint="", schema=None,
-                trace=[], final_state=None, qa_answer=None,
-            )
+        with st.spinner("Fetching..."):
+            load_document(src_input)
         st.rerun()
+
+    force = st.checkbox("Force re-index", help="Ignore the cache and embed again.")
+    if force and st.session_state.doc_src:
+        if st.button("Re-index this doc", use_container_width=True):
+            with st.spinner("Re-indexing..."):
+                load_document(st.session_state.doc_src, force_reindex=True)
+            st.toast("Re-indexed")
+            st.rerun()
 
     if st.button("Reset session", use_container_width=True):
         reset_session()
@@ -167,12 +185,18 @@ with st.sidebar:
         for doc in indexed:
             col_a, col_b = st.columns([4, 1])
             with col_a:
-                st.write(f"**{doc['doc_name'] or '(doc)'}** — {doc['chunks']} chunks")
-                st.caption(doc["doc_url"][:55])
+                age = doc_cache.describe_age(doc.get("embedded_at", ""))
+                if st.button(f"{doc['doc_name'] or '(doc)'} — {doc['chunks']} chunks",
+                             key=f"load_{doc['doc_url']}",
+                             help=f"Indexed {age}. Click to load instantly.",
+                             use_container_width=True):
+                    with st.spinner("Loading..."):
+                        load_document(doc["doc_url"])
+                    st.rerun()
+                st.caption(f"indexed {age}")
             with col_b:
                 if st.button("🗑", key=f"del_{doc['doc_url']}", help="Delete this document"):
-                    removed = delete_doc(vs, doc["doc_url"])
-                    st.toast(f"Removed {removed} chunks")
+                    st.toast(f"Removed {delete_doc(vs, doc['doc_url'])} chunks")
                     st.rerun()
         if st.button("Clear entire store", use_container_width=True):
             st.toast(f"Cleared {clear(vs)} chunks")
@@ -204,11 +228,9 @@ fr = st.session_state.fetch_result
 
 # ---------- stage 0: nothing loaded ----------
 if st.session_state.stage == 0:
-    if fr is not None and fr.looks_thin:
-        st.error(
-            f"That page returned only {fr.char_count} characters — likely a "
-            "JavaScript-rendered shell. Save it as a PDF and pass the file path, or use "
-            "an OpenAPI/Swagger or raw-markdown version of the docs."
+    if fr is not None and not fr.ok:
+        (st.error if fr.verdict in ("not_usable", "error") else st.warning)(
+            f"**{fr.verdict.replace('_', ' ').title()}** — {fr.message}"
         )
     else:
         st.info("Load an API documentation page from the sidebar to begin.")
@@ -217,8 +239,23 @@ if st.session_state.stage == 0:
 # ---------- header metrics ----------
 c1, c2, c3 = st.columns(3)
 c1.metric("Characters", f"{fr.char_count:,}")
-c2.metric("Chunks", len(st.session_state.docs))
+c2.metric("Chunks", sum(n for _, n in st.session_state.sections))
 c3.metric("Sections", len(st.session_state.sections))
+
+_CACHE_MSG = {
+    doc_cache.FRESH: ("success", "Reused the existing index — nothing was re-embedded."),
+    doc_cache.CHANGED: ("warning", "The documentation had changed, so it was re-indexed."),
+    doc_cache.STALE: ("info", "The index was past its freshness window, so it was refreshed."),
+    doc_cache.NOT_CACHED: ("info", "Indexed for the first time."),
+}
+kind, msg = _CACHE_MSG.get(st.session_state.cache_state, ("info", ""))
+if msg:
+    age = doc_cache.describe_age((st.session_state.cache_meta or {}).get("embedded_at", ""))
+    suffix = f" (previously indexed {age})" if st.session_state.cache_state != doc_cache.NOT_CACHED else ""
+    getattr(st, kind)(msg + suffix)
+
+if fr.verdict == "flat":
+    st.warning(f"**Flat document** — {fr.message}")
 
 tab_explore, tab_run = st.tabs(["Explore the docs", "Run a goal"])
 
@@ -228,11 +265,9 @@ with tab_explore:
     st.caption("Straight from the doc's headings — no LLM, no embedding, instant.")
     for name, n in st.session_state.sections:
         with st.expander(f"{name}  ·  {n} chunks"):
-            preview = [d for d in st.session_state.docs
-                       if d.metadata["endpoint_section"] == name][:2]
-            for d in preview:
-                st.caption(d.metadata.get("section_title", ""))
-                st.text(d.page_content[:400] + ("..." if len(d.page_content) > 400 else ""))
+            texts = get_section_chunks(vs, name)[:2]
+            for t in texts:
+                st.text(t[:400] + ("..." if len(t) > 400 else ""))
 
     st.divider()
     st.subheader("Ask the documentation")
@@ -254,7 +289,6 @@ with tab_explore:
         )
 
     if st.button("Ask") and question.strip():
-        ensure_indexed()
         section = None if scope == "All sections" else scope
         with st.spinner(f"Searching {'the docs' if section is None else scope}..."):
             answer, sources = answer_question(
@@ -312,7 +346,6 @@ with tab_run:
                     col_a.markdown(f"**{c.section}**  \n`{c.confidence}` — {c.why}")
                     if col_b.button("Use", key=f"cand_{i}"):
                         st.session_state.target_endpoint = c.section
-                        ensure_indexed()
                         with st.spinner("Checking for global sections (pagination/auth)..."):
                             st.session_state.global_sections = identify_global_sections(
                                 [n for n, _ in st.session_state.sections], exclude=c.section
@@ -344,6 +377,15 @@ with tab_run:
                      f"{schema.pagination.param_names}")
             st.write(f"**Records at** `{schema.response_data_path or '(top-level array)'}`")
             st.write(f"**Params** {len(schema.parameters)}")
+        _warnings = check_schema(schema)
+        if _warnings:
+            st.warning(
+                "**This schema may not be based on real endpoint documentation.**\n\n"
+                + "\n".join(f"- {w}" for w in _warnings)
+                + "\n\nRunning it will probably fail. Try a different section, or a "
+                "page that actually specifies the endpoint."
+            )
+
         with st.expander("Full schema (JSON)"):
             st.json(json.loads(schema.model_dump_json()))
 

@@ -77,3 +77,9 @@ KEY_STRATEGY = "derived"
 # --- Docs Q&A (frontend) ---
 QA_TOP_K = 8            # chunks retrieved to answer a question about the docs
 QA_MAX_OUTPUT_TOKENS = 1024  # answers stay short
+
+# --- Document cache (Phase 4.3) ---
+# A doc that is already indexed, UNCHANGED (same content hash), and younger than
+# DOC_TTL_DAYS is reused instead of re-embedded. The hash catches edits immediately;
+# the TTL is a backstop so the store cannot ossify.
+DOC_TTL_DAYS = 30

@@ -1,4 +1,8 @@
-"""Persistent ChromaDB vector store (HNSW cosine), plus store management."""
+"""Persistent ChromaDB vector store (HNSW cosine), plus store management.
+
+The store is a PERSISTENT LIBRARY, not a scratchpad: many documents coexist, and
+retrieval is always metadata-scoped so they never interfere.
+"""
 from collections import defaultdict
 
 from langchain_chroma import Chroma
@@ -24,7 +28,6 @@ def count(vectorstore):
 
 
 def clear(vectorstore):
-    """Remove ALL chunks from the store."""
     data = vectorstore.get()
     ids = data.get("ids", [])
     if ids:
@@ -35,21 +38,24 @@ def clear(vectorstore):
 # ---------------------------------------------------------------- management
 
 def list_docs(vectorstore):
-    """What documents are currently indexed? -> [{doc_url, doc_name, chunks}]"""
+    """Indexed documents -> [{doc_url, doc_name, chunks, embedded_at, content_hash}]"""
     data = vectorstore.get(include=["metadatas"])
-    grouped = defaultdict(lambda: {"doc_name": "", "chunks": 0})
+    grouped = defaultdict(lambda: {"doc_name": "", "chunks": 0,
+                                   "embedded_at": "", "content_hash": ""})
     for meta in data.get("metadatas", []) or []:
-        url = (meta or {}).get("doc_url") or (meta or {}).get("doc_name") or "(unknown)"
-        grouped[url]["doc_name"] = (meta or {}).get("doc_name", "")
-        grouped[url]["chunks"] += 1
-    return [
-        {"doc_url": url, "doc_name": info["doc_name"], "chunks": info["chunks"]}
-        for url, info in sorted(grouped.items(), key=lambda kv: -kv[1]["chunks"])
-    ]
+        meta = meta or {}
+        url = meta.get("doc_url") or meta.get("doc_name") or "(unknown)"
+        entry = grouped[url]
+        entry["doc_name"] = meta.get("doc_name", "")
+        entry["embedded_at"] = meta.get("embedded_at", "")
+        entry["content_hash"] = meta.get("content_hash", "")
+        entry["chunks"] += 1
+    return [dict(doc_url=url, **info)
+            for url, info in sorted(grouped.items(), key=lambda kv: -kv[1]["chunks"])]
 
 
 def delete_doc(vectorstore, doc_url):
-    """Remove every chunk belonging to ONE document. Returns how many were removed."""
+    """Remove every chunk of ONE document. Returns how many were removed."""
     data = vectorstore.get(where={"doc_url": doc_url})
     ids = data.get("ids", [])
     if ids:
@@ -58,9 +64,30 @@ def delete_doc(vectorstore, doc_url):
 
 
 def has_doc(vectorstore, doc_url):
-    """Is this document already indexed? (groundwork for doc caching in 4.3)"""
-    data = vectorstore.get(where={"doc_url": doc_url}, limit=1)
-    return bool(data.get("ids"))
+    return bool(vectorstore.get(where={"doc_url": doc_url}, limit=1).get("ids"))
+
+
+def reindex_doc(vectorstore, doc_url, documents):
+    """Replace a document's chunks: DELETE then add.
+
+    Delete-then-add, never append: appending would leave the old and new versions in the
+    store together and retrieval would mix stale text with current text.
+    """
+    removed = delete_doc(vectorstore, doc_url)
+    add_documents(vectorstore, documents)
+    return removed
+
+
+def get_doc_sections(vectorstore, doc_url):
+    """Section names + chunk counts for an ALREADY-INDEXED document.
+
+    Lets a cached document be loaded without re-fetching or re-chunking it.
+    """
+    data = vectorstore.get(where={"doc_url": doc_url}, include=["metadatas"])
+    counts = defaultdict(int)
+    for meta in data.get("metadatas", []) or []:
+        counts[(meta or {}).get("endpoint_section", "(page)")] += 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
 # ---------------------------------------------------------------- retrieval
